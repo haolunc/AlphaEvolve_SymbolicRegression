@@ -1,0 +1,431 @@
+"""
+Develop a compact and physically interpretable model for the exchange correlation energy density in Density Functional Theory (DFT).
+
+Background:
+We have computed inverse DFT exchange correlation energy density data for three atoms (Helium, Neon, Oxygen)
+with the Jellium model. The goal is to discover the functional form of e_xc (exchange correlation energy density).
+
+Objective:
+Construct a mathematical expression for exchange correlation energy density e_xc as a function of:
+- ρ (rho): electron density
+- s: reduced density gradient, defined as s = |∇ρ| / (2(3π²)^(1/3) ρ^(4/3))
+
+The model should:
+1. Be physically interpretable and align with known DFT principles
+2. Include gradient corrections that capture semi-local and nonlocal effects
+3. Be compact enough to be computationally efficient
+
+Inputs:
+- rho (ρ): electron density at each grid point
+- s: reduced density gradient
+
+Constraints:
+- You may only use the following jax.numpy operations: (+), (-), (*), (/), (.**.), (·**2), (·**3), (jnp.log)
+- The model should not be too complex. **Use less than 15 parameters!**
+- Consider that the LDA exchange energy density is proportional to ρ^(4/3)
+
+Philosophy:
+- Start from known physics
+- Enhancement factors should be reasonable
+- Think about asymptotic limits: what happens when s → 0 (uniform density) or s → ∞ (rapidly varying density)?
+- Consider established functionals (PBE, B88, PW92 ...) as inspiration, but allow for novel forms
+"""
+import numpy as np
+import pandas as pd
+import cma
+from scipy.optimize import minimize
+import jax
+import jax.numpy as jnp
+
+ATOM_ATOMIC_NUMBERS = [2, 2, 2, 2, 2, 8, 8, 8, 8, 10, 10,10]
+ATOM_RC_VALUES = [0.5, 1.0, 2.0, 3.0, 4.0, 0.5, 1.0, 2.0, 3.0, 0.5, 1.0, 2.0]
+
+# Initialize parameters
+MAX_NPARAMS = 20
+PARAMS_INIT = [1.0] * MAX_NPARAMS
+
+# Physical constants
+C_LDA = -3/4 * (3/jnp.pi)**(1/3)
+C_s = 1 / (2 * (3 * jnp.pi**2)**(1/3))
+
+
+@jax.jit
+def get_gradients(rho: jnp.ndarray, s: jnp.ndarray, params: jnp.ndarray):
+    def eq_scalar(rho_val, s_val):
+        """Scalar version of equation for gradient computation."""
+        e_x, e_c = equation(rho_val, s_val, params)
+        e_xc = e_x + e_c
+        return e_xc
+    
+    # Compute element-wise gradients efficiently
+    grad_rho = jax.vmap(jax.grad(eq_scalar, argnums=0))(rho, s)
+    grad_s = jax.vmap(jax.grad(eq_scalar, argnums=1))(rho, s)
+
+    return grad_rho, grad_s
+
+@evaluate.run
+def evaluate(data: dict) -> float:
+    """Evaluate the equation by comparing integrated total exchange energy and potential.
+
+    The data dict contains:
+    - rho: electron density at each grid point
+    - s: reduced density gradient at each grid point
+    - ex: target exchange energy density at each grid point
+    - weights: grid weights for numerical integration over 3D space
+    - atom_index: index indicating which atom each grid point belongs to
+    - vxc: target exchange-correlation potential at each grid point
+    - r: radial coordinate for each grid point
+    - rho_gradient_sign: sign of density gradient (for computing dedgrad term)
+
+    Loss function has two components:
+    1. Energy loss: compares integrated total exchange energy E_x = ∫ e_x(r) w(r) dr
+    2. Potential loss: compares exchange-correlation potential v_xc ≈ ∂e_x/∂ρ
+    """
+
+    # Load and pre-process data observations
+    rho = data['rho']
+    s = data['s']
+    exc = data['exc']
+    weights = data['weights']
+    atom_index = data['atom_index']
+    vxc_target = data['vxc']
+    r = data['r']
+    rho_gradient_sign = data['rho_gradient_sign']
+
+    # Determine number of atoms
+    unique_atoms = np.unique(atom_index)
+    n_atoms = len(unique_atoms)
+
+    # Loss weighting parameters (tunable)
+    c_energy = 1.0e6     # Weight for energy loss
+    c_potential = 1.0    # Weight for potential loss
+
+    # ===== PRE-PROCESS DATA BY ATOM (OPTIMIZATION 1) =====
+    # Convert to JAX arrays once and split by atom to avoid repeated operations
+    atom_data_list = []
+    for atom_idx in unique_atoms:
+        atom_mask = atom_index == atom_idx
+        if np.sum(atom_mask) == 0:
+            continue
+        
+        atom_data = {
+            'rho': jnp.array(rho[atom_mask]),
+            's': jnp.array(s[atom_mask]),
+            'exc_target': jnp.array(exc[atom_mask]),
+            'weights': jnp.array(weights[atom_mask]),
+            'vxc_target': jnp.array(vxc_target[atom_mask]),
+            'r': jnp.array(r[atom_mask]),
+            'rho_gradient_sign': jnp.array(rho_gradient_sign[atom_mask]),
+            'atom_index': atom_idx
+        }
+        atom_data_list.append(atom_data)
+    
+    # Convert full arrays to JAX for gradient computation
+    rho_jax = jnp.array(rho)
+    s_jax = jnp.array(s)
+    
+    # ===== PURE JAX LOSS FUNCTION (OPTIMIZATION 2 & 3) =====
+    @jax.jit
+    def compute_atom_V_loss(atom_data, grad_rho_atom, grad_s_atom):
+        """Compute loss for a single atom (JIT-compiled for speed).
+        
+        Note: V_params and E_params removed - we use auto-alignment.
+        E_params are computed analytically after aggregating all atoms of the same type.
+        """
+        rho_atom = atom_data['rho']
+        s_atom = atom_data['s']
+        weights_atom = atom_data['weights']
+        vxc_target_atom = atom_data['vxc_target']
+        r_atom = atom_data['r']
+        rho_gradient_sign_atom = atom_data['rho_gradient_sign']
+        
+        # === Potential Loss with Auto-Alignment ===
+        # 1. Compute raw vxc_pred (same as before)
+        vrho_per_atom = grad_rho_atom + grad_s_atom * (-4/3*s_atom/rho_atom)
+        
+        # Gradient contribution term
+        dedgrad_per_atom = grad_s_atom * C_s / rho_atom**(4/3) * rho_gradient_sign_atom
+        r2_dedgrad_per_atom = r_atom**2 * dedgrad_per_atom
+        d_r2_dedgrad_dr = jnp.gradient(r2_dedgrad_per_atom, r_atom)
+        
+        # Raw predicted potential
+        vxc_pred_raw = vrho_per_atom - d_r2_dedgrad_dr / r_atom**2
+        
+        # 2. Auto-alignment: compute optimal shift C analytically
+        # C_optimal = Σ(w_i * ρ_i * (v_pred - v_target)) / Σ(w_i * ρ_i)
+        integration_weights = rho_atom * weights_atom
+        total_weight = jnp.sum(integration_weights)
+        
+        diff_raw = vxc_pred_raw - vxc_target_atom
+        mean_shift = jnp.sum(diff_raw * integration_weights) / total_weight
+        
+        # 3. Align prediction to target (remove mean shift)
+        vxc_pred_aligned = vxc_pred_raw - mean_shift
+        
+        # 4. Compute shape-only loss (after alignment)
+        vxc_diff = (vxc_pred_aligned - vxc_target_atom)**2
+        V_loss = jnp.sum(integration_weights * vxc_diff)
+        
+        return V_loss
+    
+    def combined_loss(params):
+        """Combined loss: energy loss + potential loss (fully JAX-ified).
+        
+        Note: E_params and V_params removed - computed analytically.
+        params structure: [equation_params(n)]
+        """
+        equation_params = params
+        equation_params_jax = jnp.array(equation_params)
+        
+        # Compute e_xc for all points
+        e_x_pred, e_c_pred = equation(rho_jax, s_jax, equation_params_jax)
+        e_xc_pred = e_x_pred + e_c_pred
+        # Compute gradients using JAX (efficient with JIT)
+        grad_rho, grad_s = get_gradients(rho_jax, s_jax, equation_params_jax)
+        
+        # ===== Compute E_params analytically =====
+        # For each atom type, collect (delta_E * a) and (a^2) where a = rc^(-4/3)
+        # E_params[k] = sum(delta_E_j * a_j) / sum(a_j^2)
+        sum_delta_E_a = {2: 0.0, 8: 0.0, 10: 0.0}  # atomic_number -> sum
+        sum_a2 = {2: 0.0, 8: 0.0, 10: 0.0}
+        
+        # First pass: compute predicted energies and accumulate for E_params
+        current_idx = 0
+        atom_energies = []  # Store (Exc_pred, Exc_target, atom_idx, rc) for each atom
+        for atom_data in atom_data_list:
+            n_points = len(atom_data['rho'])
+            atom_idx = atom_data['atom_index']
+            atom_rc_value = ATOM_RC_VALUES[atom_idx]
+            atomic_num = ATOM_ATOMIC_NUMBERS[atom_idx]
+            
+            e_xc_pred_atom = e_xc_pred[current_idx:current_idx + n_points]
+            weights_atom = atom_data['weights']
+            exc_target_atom = atom_data['exc_target']
+            
+            Exc_pred = jnp.sum(e_xc_pred_atom * weights_atom)
+            Exc_target_raw = jnp.sum(exc_target_atom * weights_atom)
+            
+            a = atom_rc_value ** (-4/3)
+            delta_E = Exc_target_raw - Exc_pred
+            
+            sum_delta_E_a[atomic_num] += delta_E * a
+            sum_a2[atomic_num] += a ** 2
+            
+            atom_energies.append((Exc_pred, Exc_target_raw, atomic_num, atom_rc_value))
+            current_idx += n_points
+        
+        # Compute analytical E_params for each atom type
+        E_params_analytical = {}
+        for atomic_num in [2, 8, 10]:
+            if sum_a2[atomic_num] > 0:
+                E_params_analytical[atomic_num] = sum_delta_E_a[atomic_num] / sum_a2[atomic_num]
+            else:
+                E_params_analytical[atomic_num] = 0.0
+        
+        # Second pass: compute losses
+        E_losses = []
+        V_losses = []
+        current_idx = 0
+        for i, atom_data in enumerate(atom_data_list):
+            n_points = len(atom_data['rho'])
+            Exc_pred, Exc_target_raw, atomic_num, atom_rc_value = atom_energies[i]
+            
+            # E_params_atom computed analytically
+            E_params_atom = E_params_analytical[atomic_num] * atom_rc_value ** (-4/3)
+            Exc_target = Exc_target_raw - E_params_atom
+            E_loss = (Exc_pred - Exc_target) ** 2
+            E_losses.append(E_loss)
+            
+            # Extract predictions for V_loss
+            grad_rho_atom = grad_rho[current_idx:current_idx + n_points]
+            grad_s_atom = grad_s[current_idx:current_idx + n_points]
+            e_xc_pred_atom = e_xc_pred[current_idx:current_idx + n_points]
+            
+            # Compute V_loss (JIT-compiled, auto-aligned)
+            V_loss = compute_atom_V_loss(
+                atom_data, grad_rho_atom, grad_s_atom
+            )
+            V_losses.append(V_loss)
+            current_idx += n_points
+        
+        # Combined loss
+        total_E_loss = jnp.mean(jnp.array(E_losses))
+        total_V_loss = jnp.mean(jnp.array(V_losses))
+        total_loss = c_energy * total_E_loss + c_potential * total_V_loss
+        
+        return float(total_loss)
+    
+    # ===== OPTIMIZATION 4: Analytical gradients for optimizers =====
+    def loss_and_grad_fn(params):
+        """Compute both loss and gradient using JAX autodiff.
+        
+        Note: E_params and V_params removed - computed analytically.
+        """
+        def loss_fn(p):
+            equation_params_jax = jnp.array(p)
+            e_x_pred, e_c_pred = equation(rho_jax, s_jax, equation_params_jax)
+            e_xc_pred = e_x_pred + e_c_pred
+            grad_rho, grad_s = get_gradients(rho_jax, s_jax, equation_params_jax)
+            
+            # Compute E_params analytically (same logic as combined_loss)
+            sum_delta_E_a = {2: 0.0, 8: 0.0, 10: 0.0}
+            sum_a2 = {2: 0.0, 8: 0.0, 10: 0.0}
+            
+            current_idx = 0
+            atom_energies = []
+            for atom_data in atom_data_list:
+                n_points = len(atom_data['rho'])
+                atom_idx = atom_data['atom_index']
+                atom_rc_value = ATOM_RC_VALUES[atom_idx]
+                atomic_num = ATOM_ATOMIC_NUMBERS[atom_idx]
+                
+                e_xc_pred_atom = e_xc_pred[current_idx:current_idx + n_points]
+                weights_atom = atom_data['weights']
+                exc_target_atom = atom_data['exc_target']
+                
+                Exc_pred = jnp.sum(e_xc_pred_atom * weights_atom)
+                Exc_target_raw = jnp.sum(exc_target_atom * weights_atom)
+                
+                a = atom_rc_value ** (-4/3)
+                delta_E = Exc_target_raw - Exc_pred
+                
+                sum_delta_E_a[atomic_num] = sum_delta_E_a[atomic_num] + delta_E * a
+                sum_a2[atomic_num] = sum_a2[atomic_num] + a ** 2
+                
+                atom_energies.append((Exc_pred, Exc_target_raw, atomic_num, atom_rc_value))
+                current_idx += n_points
+            
+            E_params_analytical = {}
+            for atomic_num in [2, 8, 10]:
+                if sum_a2[atomic_num] > 0:
+                    E_params_analytical[atomic_num] = sum_delta_E_a[atomic_num] / sum_a2[atomic_num]
+                else:
+                    E_params_analytical[atomic_num] = 0.0
+            
+            E_losses = []
+            V_losses = []
+            current_idx = 0
+            for i, atom_data in enumerate(atom_data_list):
+                n_points = len(atom_data['rho'])
+                Exc_pred, Exc_target_raw, atomic_num, atom_rc_value = atom_energies[i]
+                
+                E_params_atom = E_params_analytical[atomic_num] * atom_rc_value ** (-4/3)
+                Exc_target = Exc_target_raw - E_params_atom
+                E_loss = (Exc_pred - Exc_target) ** 2
+                E_losses.append(E_loss)
+                
+                grad_rho_atom = grad_rho[current_idx:current_idx + n_points]
+                grad_s_atom = grad_s[current_idx:current_idx + n_points]
+                e_xc_pred_atom = e_xc_pred[current_idx:current_idx + n_points]
+                
+                V_loss = compute_atom_V_loss(
+                    atom_data, grad_rho_atom, grad_s_atom
+                )
+                V_losses.append(V_loss)
+                current_idx += n_points
+            
+            total_E_loss = jnp.mean(jnp.array(E_losses))
+            total_V_loss = jnp.mean(jnp.array(V_losses))
+            return c_energy * total_E_loss + c_potential * total_V_loss
+        
+        val, grad = jax.value_and_grad(loss_fn)(params)
+        return float(val), np.array(grad)
+
+    # Wrapper for optimizers
+    def loss_fn(params):
+        return combined_loss(params)
+    
+    def grad_fn(params):
+        _, grad = loss_and_grad_fn(params)
+        return grad
+
+    # ===== STEP 1: Use BFGS to determine which parameters are used =====
+    print("Running BFGS to determine used parameters...")
+    res_local = minimize(loss_fn, PARAMS_INIT, method='BFGS', jac=grad_fn)
+    
+    # Determine number of parameters actually used
+    num_params_used = np.argmax(np.isclose(res_local.x, 1.0, atol=1e-6))
+    if num_params_used == 0:
+        num_params_used = MAX_NPARAMS
+    
+    print(f"Number of parameters used: {num_params_used}")
+    
+    # Extract only the used parameters for CMA-ES and clip to bounds
+    params_init_used = np.clip(res_local.x[:num_params_used], -5, 5).tolist()
+    
+    # ===== STEP 2: CMA-ES OPTIMIZATION =====
+    print("Starting CMA-ES Optimization...")
+    
+    es = cma.CMAEvolutionStrategy(params_init_used, 0.5, {'bounds': [-5, 5], 'popsize': 100, 'maxiter': 300})
+    
+    # CMA-ES optimization loop - Phase 1 (100 iterations)
+    for _ in range(100):
+        if es.stop():
+            break
+        solutions = es.ask()
+        fitness_list = [combined_loss(x) for x in solutions]
+        es.tell(solutions, fitness_list)
+        es.logger.add()
+        es.disp()
+    
+    # Check if result is promising (< 0.05), if so continue to 300 iterations
+    if es.result.fbest < 0.5:
+        print(f"Phase 1 result ({es.result.fbest:.6f}) < 0.5, continuing optimization...")
+        # Continue for remaining 200 iterations
+        for _ in range(200):
+            if es.stop():
+                break
+            solutions = es.ask()
+            fitness_list = [combined_loss(x) for x in solutions]
+            es.tell(solutions, fitness_list)
+            es.logger.add()
+            es.disp()
+    else:
+        print(f"Phase 1 result ({es.result.fbest:.6f}) >= 0.5, stopping early.")
+    
+    
+    res = es.result
+    # Reconstruct full parameter array
+    optimized_params = res.xbest
+    loss = res.fbest
+
+    if np.isnan(loss) or np.isinf(loss):
+        return None
+    else:
+        return -loss, optimized_params
+
+
+@equation.evolve
+def equation(rho: jnp.ndarray, s: jnp.ndarray, params: jnp.ndarray) -> jnp.ndarray:
+    """Computes exchange-correlation energy density (e_xc) using PBE exchange without correlation.
+
+    Args:
+        rho: Electron density at each grid point.
+        s: Reduced density gradient, defined as s = |∇ρ|/(2k_F*ρ) where k_F = (3π²ρ)^(1/3).
+        params: Array of optimizable numeric constants or parameters.
+
+    Returns:
+        Two arrays representing exchange energy density (e_x) and correlation energy density (e_c).
+
+    Physical interpretation:
+        - LDA exchange: e_x^LDA = -C_x * ρ^(4/3)
+        - Gradient corrections via the reduced gradient s improve upon LDA using the PBE functional form.
+    """
+    # LDA exchange energy density: proportional to ρ^(4/3)
+    e_x_lda = params[0] * rho**(4/3)
+
+    # ========== PBE Exchange ==========
+    # Extract PBE parameters
+    kappa = params[1]
+    mu = params[2]
+    
+    # PBE enhancement factor: F_x(s) = 1 + κ - κ/(1 + μs²/κ)
+    F_x = 1.0 + kappa - kappa / (1.0 + mu * s**2 / kappa)
+    
+    # Apply PBE enhancement to LDA exchange
+    e_x = e_x_lda * F_x
+
+    # Correlation term not yet implemented
+    e_c = 0
+    
+    return e_x, e_c
