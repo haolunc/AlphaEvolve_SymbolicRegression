@@ -1,11 +1,5 @@
 """A distributed implementation of the physr pipeline.
 
-This implementation distributes the computation across multiple processes:
-- 1 database process: Manages the program database, generates prompts, and registers evaluation results
-- 4 sampler processes: Generate program samples based on prompts from the database
-- 2 evaluator processes: Evaluate the generated program samples
-- 1 monitoring process: Monitors performance of all processes and reports statistics every 60 seconds
-
 The workflow is as follows:
 1. An initial program is evaluated by the first evaluator process
 2. The database process registers the initial program and begins generating prompts
