@@ -63,7 +63,7 @@ def get_gradients(rho: jnp.ndarray, s: jnp.ndarray, params: jnp.ndarray):
 
     return grad_rho, grad_s
 
-@evaluate.run
+# @evaluate.run
 def evaluate(data: dict) -> float:
     """Evaluate the equation by comparing integrated total exchange energy and potential.
 
@@ -395,7 +395,7 @@ def evaluate(data: dict) -> float:
         return -loss, optimized_params
 
 
-@equation.evolve
+# @equation.evolve
 def equation(rho: jnp.ndarray, s: jnp.ndarray, params: jnp.ndarray) -> jnp.ndarray:
     """Computes exchange-correlation energy density (e_xc) using PBE exchange without correlation.
 

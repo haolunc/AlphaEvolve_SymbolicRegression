@@ -10,34 +10,61 @@
 
 The architecture consists of three main modules: the **Program Database**, the **LLM Sampler**, and the **Evaluator**. The workflow operates as an iterative loop:
 
-1. **Prompting**: Construct a prompt by selecting historical programs from the database and combining them with specific task instructions. (`programs_database.py`)
+1. **Prompting**: Construct a prompt by selecting historical programs from the database and combining them with specific task instructions. (`database.py`)
 
 2. **Sampling**: Feed this prompt to the LLM Sampler, which generates new candidate equations. (`sampler.py`)
 
 3. **Evaluation**: The Evaluator takes these candidates and uses the provided data to optimize their parameters, then calculates the accuracy of the fit. (`evaluator.py`)
 
-4. **Update**: Valid equations are stored back into the Program Database. These serve as *in-context examples* for future prompts, continuously improving the model's performance in subsequent iterations. (`programs_database.py`)
+4. **Update**: Valid equations are stored back into the Program Database. These serve as *in-context examples* for future prompts, continuously improving the model's performance in subsequent iterations. (`database.py`)
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/<user>/AlphaEvolve_SymbolicRegression.git
+cd AlphaEvolve_SymbolicRegression
+
+# Install in development mode (with test/lint tools)
+pip install -e ".[dev]"
+
+# Or install with Gemini support
+pip install -e ".[gemini]"
+
+# Or install with example dependencies (CMA-ES)
+pip install -e ".[examples]"
+```
 
 ## File Structure
 
-| File | Description |
-|------|-------------|
-| `programs_database.py` | Program database with island-based evolutionary algorithm |
-| `sampler.py` | LLM interface for generating new equations |
-| `evaluator.py` | Sandbox execution and parameter optimization |
-| `profiler.py` | TensorBoard logging for database status |
-| `checkpoint_util.py` | Checkpoint saving/loading for experiment resumption |
-| `config.py` | Configuration parameters for Program Database |
-| `code_manipulation.py` | Python code parsing; core data classes for evolution |
-| `distribution_util.py` | Utilities for distributed execution |
-| `equ_comp.py` | Equation complexity calculation |
-| `logging_utils.py` | Logging utilities |
+```
+src/alpha_evolve_sr/
+├── __init__.py          # Package exports
+├── cli.py               # CLI entry point (was main_distributed.py)
+├── config.py            # Configuration dataclasses
+├── database.py          # Program database with island-based evolutionary algorithm (was programs_database.py)
+├── sampler.py           # LLM provider interface and sampling
+├── evaluator.py         # Sandbox execution and parameter optimization
+├── profiler.py          # TensorBoard logging for database status
+├── checkpoint.py        # Checkpoint saving/loading (was checkpoint_util.py)
+├── code_manipulation.py # Python code parsing; core data classes for evolution
+├── complexity.py        # Equation complexity calculation (was equ_comp.py)
+├── workers.py           # Distributed worker processes (was distribution_util.py)
+├── logging_config.py    # Unified logging configuration (was logging_utils.py)
+└── exceptions.py        # Custom exception hierarchy
+tests/
+├── test_code_manipulation.py
+├── test_complexity.py
+├── test_config.py
+├── test_database.py
+└── test_checkpoint.py
+```
 
 ## Quick Start
 
 ```bash
-# Basic run
-python implementation/main_distributed.py \
+# Basic run (distributed mode)
+alpha-evolve-sr \
   --spec_path <spec_path> \
   --data_folder <data_path> \
   --log_folder <log_path> \
@@ -45,13 +72,24 @@ python implementation/main_distributed.py \
   --num_evaluators 4 \
   --num_samplers 2
 
+# Non-distributed mode
+alpha-evolve-sr \
+  --spec_path <spec_path> \
+  --data_folder <data_path> \
+  --log_folder <log_path> \
+  --no-distributed \
+  --max_samples 2000
+
 # Resume from checkpoint
-python implementation/main_distributed.py \
+alpha-evolve-sr \
   --resume_from_ckpt <log_path>/checkpoints \
   --max_samples 2000
 
 # Monitor with TensorBoard
 tensorboard --logdir <log_path> --port 6006
+
+# Run the DFT example
+python examples/run_dft_example.py --max_samples 10
 ```
 
 ---
@@ -124,16 +162,6 @@ To prevent stagnation, the weaker half of islands are periodically reset:
 2. The bottom 50% of islands are reset
 3. Each reset island is re-initialized with the best program from a randomly selected surviving island as its "founder"
 
-#### 1.4 Configuration Parameters (`config.py`)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `functions_per_prompt` | 4 | Number of historical programs to include in each prompt |
-| `num_islands` | 10 | Number of parallel islands for diversity |
-| `reset_period` | 700 | Samples between island resets |
-| `cluster_sampling_temperature_init` | 0.005 | Initial temperature for softmax sampling |
-| `cluster_sampling_temperature_period` | 200 | Period for temperature linear decay cycle |
-| `cost_per_ktoken` | (0.006, 0.024) | Cost per 1K tokens (input, output) for tracking |
 
 ---
 
@@ -145,8 +173,8 @@ The specification file (e.g., `specs/specification_example.txt`) defines the sym
 
 1. **Task Description**: A docstring explaining the problem, background, objectives, and constraints
 2. **Helper Functions**: Pre-defined functions like `get_gradients()` for computing derivatives
-3. **Evaluation Function**: The `@evaluate.run` decorated function that computes the loss
-4. **Target Function**: The `@equation.evolve` decorated function that the LLM will evolve
+3. **Evaluation Function**: The `# @evaluate.run` marked function that computes the loss
+4. **Target Function**: The `# @equation.evolve` marked function that the LLM will evolve
 
 Example structure:
 ```python
@@ -166,12 +194,12 @@ def get_gradients(...):
     ...
 
 # Evaluation function (fixed, not evolved)
-@evaluate.run
+# @evaluate.run
 def evaluate(data: dict) -> float:
     ...
 
 # Target function to evolve
-@equation.evolve
+# @equation.evolve
 def equation(rho, s, params) -> tuple:
     """Docstring with signature info."""
     # Initial implementation
@@ -307,5 +335,5 @@ class Sandbox:
 The evaluation returns:
 - `score`: Negative loss (higher is better, stored in database)
 - `optimized_params`: Best parameter values found
-- `complexity`: Equation complexity score (computed by `equ_comp.py`)
+- `complexity`: Equation complexity score (computed by `complexity.py`)
 - `complexity_detail`: Breakdown of complexity by operation type

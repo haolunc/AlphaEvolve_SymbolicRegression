@@ -1,0 +1,68 @@
+# =====================================================================
+# Required — fill these in before running
+# =====================================================================
+spec_path:           # Path to specification file (e.g. specs/specification_example.txt)
+data_folder:         # Path to data folder containing train.csv
+log_folder:          # Name for this experiment's log directory
+
+# =====================================================================
+# Pipeline
+# =====================================================================
+problem_name: oscillator1
+max_samples: 3600
+distributed: true
+num_samplers: 8
+num_evaluators: 8
+
+# =====================================================================
+# Checkpointing
+# =====================================================================
+save_ckpt_interval: 300
+# save_ckpt_dir:     # Auto-derived from log_folder if omitted
+# resume_from_ckpt:  # Set to checkpoint dir path to resume
+
+# =====================================================================
+# LLM sampler
+# =====================================================================
+sampler:
+  provider: qwen
+  samples_per_prompt: 1
+  # model_name:                # Provider default if omitted
+  temperature: 1.0
+  max_retries: 5
+  retry_delay_seconds: 5.0
+  request_timeout_seconds: 180
+  cost_per_ktoken: [0.006, 0.024]   # Cost per 1K tokens (input, output) for tracking
+
+# =====================================================================
+# Evolutionary algorithm / database
+# =====================================================================
+database:
+  functions_per_prompt: 4 # Number of historical programs to include in each prompt
+  num_islands: 10. # Number of parallel islands for diversity
+  reset_period: 700  # Samples between island resets
+  cluster_sampling_temperature_init: 0.005   # Initial temperature for softmax sampling
+  cluster_sampling_temperature_period: 200   # Period for temperature linear decay cycle
+  complexity_bin_size: 10
+  cluster_max_size: 100
+  pareto_aware: false
+
+# =====================================================================
+# Evaluator
+# =====================================================================
+evaluator:
+  timeout_seconds: 400
+
+# =====================================================================
+# Profiler (TensorBoard logging)
+# =====================================================================
+profiler:
+  log_frequency: 100
+  complexity_group_size: 5
+
+# =====================================================================
+# Worker performance reporting
+# =====================================================================
+worker:
+  perf_report_interval_seconds: 150
+  monitor_interval_seconds: 300
