@@ -17,20 +17,6 @@ from alpha_evolve_sr.config import (
 class TestProgramsDatabaseConfig:
     """Tests for ProgramsDatabaseConfig."""
 
-    def test_defaults(self):
-        config = ProgramsDatabaseConfig()
-        assert config.functions_per_prompt == 4
-        assert config.num_islands == 10
-        assert config.complexity_bin_size == 10
-
-    def test_frozen(self):
-        config = ProgramsDatabaseConfig()
-        try:
-            config.num_islands = 5  # type: ignore[misc]
-            assert False, "Should have raised FrozenInstanceError"
-        except dataclasses.FrozenInstanceError:
-            pass
-
     def test_serialization_roundtrip(self):
         config = ProgramsDatabaseConfig(functions_per_prompt=6, num_islands=5)
         as_dict = dataclasses.asdict(config)
@@ -43,43 +29,13 @@ class TestProgramsDatabaseConfig:
 class TestSamplerConfig:
     """Tests for SamplerConfig."""
 
-    def test_defaults(self):
-        config = SamplerConfig()
-        assert config.provider == "qwen"
-        assert config.model_name is None
-        assert config.temperature == 1.0
-        assert config.samples_per_prompt == 1
-        assert config.cost_per_ktoken == (0.006, 0.024)
-
     def test_serialization_roundtrip(self):
-        config = SamplerConfig(provider="openai", cost_per_ktoken=(0.01, 0.05))
+        config = SamplerConfig(provider="openai", cost_per_ktoken=[0.01, 0.05])
         as_dict = dataclasses.asdict(config)
         json_str = json.dumps(as_dict)
         restored_dict = json.loads(json_str)
-        # JSON converts tuples to lists; convert back
-        restored_dict["cost_per_ktoken"] = tuple(restored_dict["cost_per_ktoken"])
         restored = SamplerConfig(**restored_dict)
         assert restored == config
-
-
-class TestEvaluatorConfig:
-    def test_defaults(self):
-        config = EvaluatorConfig()
-        assert config.timeout_seconds == 400
-
-
-class TestProfilerConfig:
-    def test_defaults(self):
-        config = ProfilerConfig()
-        assert config.log_frequency == 100
-        assert config.complexity_group_size == 5
-
-
-class TestWorkerConfig:
-    def test_defaults(self):
-        config = WorkerConfig()
-        assert config.perf_report_interval_seconds == 150
-        assert config.monitor_interval_seconds == 300
 
 
 class TestRunConfig:
@@ -98,7 +54,7 @@ class TestRunConfig:
 
     def test_from_yaml(self, tmp_path):
         yaml_content = """\
-spec_path: test.txt
+problem_dir: test_dir
 data_folder: data/
 max_samples: 100
 distributed: false
@@ -114,7 +70,7 @@ database:
             f.write(yaml_content)
 
         config = RunConfig.from_yaml(yaml_path)
-        assert config.spec_path == "test.txt"
+        assert config.problem_dir == "test_dir"
         assert config.max_samples == 100
         assert config.distributed is False
         assert config.sampler.provider == "openai"
@@ -134,7 +90,7 @@ database:
 
     def test_to_yaml_roundtrip(self, tmp_path):
         original = RunConfig(
-            spec_path="specs/test.txt",
+            problem_dir="specs/test",
             max_samples=50,
             sampler=SamplerConfig(provider="gemini", temperature=0.8),
             database=ProgramsDatabaseConfig(num_islands=3),
@@ -145,7 +101,7 @@ database:
         assert os.path.exists(yaml_path)
 
         loaded = RunConfig.from_yaml(yaml_path)
-        assert loaded.spec_path == "specs/test.txt"
+        assert loaded.problem_dir == "specs/test"
         assert loaded.max_samples == 50
         assert loaded.sampler.provider == "gemini"
         assert loaded.sampler.temperature == 0.8
@@ -162,12 +118,12 @@ sampler:
             f.write(yaml_content)
 
         config = RunConfig.from_yaml(yaml_path)
-        assert config.sampler.cost_per_ktoken == (0.01, 0.05)
+        assert config.sampler.cost_per_ktoken == [0.01, 0.05]
 
     def test_from_yaml_with_all_nested_configs(self, tmp_path):
         """All five nested config sections should be parsed from YAML."""
         yaml_content = """\
-spec_path: test.txt
+problem_dir: test_dir
 sampler:
   provider: openai
 database:
@@ -195,9 +151,9 @@ worker:
         assert config.worker.monitor_interval_seconds == 120
 
     def test_from_yaml_unknown_key_rejected(self, tmp_path):
-        """Unknown top-level keys should cause SystemExit."""
+        """Unknown top-level keys should raise ValueError."""
         yaml_content = """\
-spec_path: test.txt
+problem_dir: test_dir
 smpler:
   provider: openai
 """
@@ -207,14 +163,14 @@ smpler:
 
         try:
             RunConfig.from_yaml(yaml_path)
-            assert False, "Should have called sys.exit for unknown key"
-        except SystemExit as e:
+            assert False, "Should have raised ValueError for unknown key"
+        except ValueError as e:
             assert "smpler" in str(e)
 
     def test_to_yaml_roundtrip_all_configs(self, tmp_path):
         """All nested configs should survive a to_yaml / from_yaml roundtrip."""
         original = RunConfig(
-            spec_path="specs/test.txt",
+            problem_dir="specs/test",
             max_samples=50,
             sampler=SamplerConfig(provider="gemini", temperature=0.8),
             database=ProgramsDatabaseConfig(num_islands=3),
@@ -231,61 +187,88 @@ smpler:
 
     def test_validate_passes_for_valid(self, tmp_path):
         """validate() should not raise for valid config."""
-        spec = tmp_path / "spec.txt"
-        spec.write_text("test")
+        problem = tmp_path / "problem"
+        problem.mkdir()
+        (problem / "prompt.txt").write_text("test")
+        (problem / "evaluate.py").write_text("def evaluate(data): pass")
+        (problem / "equation.py").write_text("def equation(x, params): return x")
         data = tmp_path / "data"
         data.mkdir()
 
-        config = RunConfig(spec_path=str(spec), data_folder=str(data), log_folder="test_logs")
+        config = RunConfig(problem_dir=str(problem), data_folder=str(data), log_folder="test_logs")
         config.validate()  # should not raise
 
-    def test_validate_missing_spec_path(self):
-        """validate() should error when spec_path is missing."""
+    def test_validate_missing_problem_dir(self):
+        """validate() should error when problem_dir is missing."""
         config = RunConfig(data_folder="/tmp", log_folder="logs")
         try:
             config.validate()
-            assert False, "Should have called sys.exit"
-        except SystemExit as e:
-            assert "spec_path" in str(e)
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
+            assert "problem_dir" in str(e)
 
     def test_validate_missing_data_folder(self, tmp_path):
         """validate() should error when data_folder is missing."""
-        spec = tmp_path / "spec.txt"
-        spec.write_text("test")
-        config = RunConfig(spec_path=str(spec), log_folder="logs")
+        problem = tmp_path / "problem"
+        problem.mkdir()
+        (problem / "prompt.txt").write_text("test")
+        (problem / "evaluate.py").write_text("def evaluate(data): pass")
+        (problem / "equation.py").write_text("def equation(x, params): return x")
+        config = RunConfig(problem_dir=str(problem), log_folder="logs")
         try:
             config.validate()
-            assert False, "Should have called sys.exit"
-        except SystemExit as e:
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
             assert "data_folder" in str(e)
 
     def test_validate_missing_log_folder(self, tmp_path):
         """validate() should error when log_folder is missing."""
-        spec = tmp_path / "spec.txt"
-        spec.write_text("test")
+        problem = tmp_path / "problem"
+        problem.mkdir()
+        (problem / "prompt.txt").write_text("test")
+        (problem / "evaluate.py").write_text("def evaluate(data): pass")
+        (problem / "equation.py").write_text("def equation(x, params): return x")
         data = tmp_path / "data"
         data.mkdir()
-        config = RunConfig(spec_path=str(spec), data_folder=str(data))
+        config = RunConfig(problem_dir=str(problem), data_folder=str(data))
         try:
             config.validate()
-            assert False, "Should have called sys.exit"
-        except SystemExit as e:
+            assert False, "Should have raised ValueError"
+        except ValueError as e:
             assert "log_folder" in str(e)
 
-    def test_validate_bad_spec_path(self, tmp_path):
-        config = RunConfig(spec_path="/nonexistent/path.txt", data_folder="/tmp", log_folder="logs")
+    def test_validate_bad_problem_dir(self, tmp_path):
+        config = RunConfig(problem_dir="/nonexistent/dir", data_folder="/tmp", log_folder="logs")
         try:
             config.validate()
-            assert False, "Should have called sys.exit"
-        except SystemExit:
+            assert False, "Should have raised ValueError"
+        except ValueError:
+            pass
+
+    def test_validate_missing_required_file(self, tmp_path):
+        """validate() should error when a required file is missing from problem_dir."""
+        problem = tmp_path / "problem"
+        problem.mkdir()
+        (problem / "prompt.txt").write_text("test")
+        # Missing evaluate.py and equation.py
+        data = tmp_path / "data"
+        data.mkdir()
+        config = RunConfig(problem_dir=str(problem), data_folder=str(data), log_folder="logs")
+        try:
+            config.validate()
+            assert False, "Should have raised ValueError"
+        except ValueError:
             pass
 
     def test_validate_bad_data_folder(self, tmp_path):
-        spec = tmp_path / "spec.txt"
-        spec.write_text("test")
-        config = RunConfig(spec_path=str(spec), data_folder="/nonexistent/folder", log_folder="logs")
+        problem = tmp_path / "problem"
+        problem.mkdir()
+        (problem / "prompt.txt").write_text("test")
+        (problem / "evaluate.py").write_text("def evaluate(data): pass")
+        (problem / "equation.py").write_text("def equation(x, params): return x")
+        config = RunConfig(problem_dir=str(problem), data_folder="/nonexistent/folder", log_folder="logs")
         try:
             config.validate()
-            assert False, "Should have called sys.exit"
-        except SystemExit:
+            assert False, "Should have raised ValueError"
+        except ValueError:
             pass

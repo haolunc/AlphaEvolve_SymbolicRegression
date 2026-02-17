@@ -9,40 +9,21 @@ import pytest
 from alpha_evolve_sr.exceptions import (
     CheckpointError,
     LLMProviderError,
-    SpecificationError,
 )
 
 
-class TestSpecificationError:
-    """SpecificationError is raised for invalid specifications."""
-
-    def test_missing_evaluate_run(self):
-        bad_spec = 'def foo():\n    pass\n# @equation.evolve\ndef equation(x, params):\n    return x\n'
-        from alpha_evolve_sr.cli import _extract_function_names
-        with pytest.raises(SpecificationError, match="@evaluate.run"):
-            _extract_function_names(bad_spec)
-
-    def test_missing_equation_evolve(self):
-        bad_spec = '# @evaluate.run\ndef evaluate(data):\n    pass\n'
-        from alpha_evolve_sr.cli import _extract_function_names
-        with pytest.raises(SpecificationError, match="@equation.evolve"):
-            _extract_function_names(bad_spec)
-
-
 class TestCheckpointError:
-    """CheckpointError is raised when checkpoint loading fails."""
+    """CheckpointError is raised when checkpoint DB operations fail."""
 
-    def test_missing_file(self, tmp_path):
-        from alpha_evolve_sr.checkpoint import load_checkpoint
-        with pytest.raises(CheckpointError, match="Failed to load"):
-            load_checkpoint(str(tmp_path))
+    def test_bad_db_path(self):
+        from alpha_evolve_sr.checkpoint import CheckpointDB
+        with pytest.raises(CheckpointError, match="Failed to open"):
+            CheckpointDB("/nonexistent/deeply/nested/test.db")
 
-    def test_corrupt_file(self, tmp_path):
-        ckpt_path = tmp_path / "checkpoint_final.pkl"
-        ckpt_path.write_bytes(b"not a pickle")
-        from alpha_evolve_sr.checkpoint import load_checkpoint
-        with pytest.raises(CheckpointError, match="Failed to load"):
-            load_checkpoint(str(tmp_path))
+    def test_missing_config(self, tmp_path):
+        from alpha_evolve_sr.checkpoint import load_config
+        with pytest.raises(CheckpointError, match="No run_config.yaml"):
+            load_config(str(tmp_path))
 
 
 class TestLLMProviderError:

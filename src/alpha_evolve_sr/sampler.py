@@ -7,13 +7,13 @@ import time
 from abc import ABC, abstractmethod
 from collections.abc import Collection
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
 from .config import SamplerConfig
 from .exceptions import LLMProviderError
 from .logging_config import get_logger
+from .messages import LLMResponse
 
 logger = get_logger("sampler")
 
@@ -21,14 +21,6 @@ logger = get_logger("sampler")
 # ---------------------------------------------------------------------------
 # Provider interface and implementations (Phase 5)
 # ---------------------------------------------------------------------------
-
-@dataclass
-class LLMResponse:
-    """Standardized response from any LLM provider."""
-    response_text: str
-    input_tokens: int
-    output_tokens: int
-    token_cost: float = 0.0
 
 
 class LLMProvider(ABC):

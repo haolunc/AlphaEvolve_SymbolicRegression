@@ -8,15 +8,32 @@ from . import code_manipulation
 
 
 @dataclasses.dataclass(frozen=True)
+class LLMResponse:
+    """Standardized response from any LLM provider."""
+
+    response_text: str
+    input_tokens: int
+    output_tokens: int
+    token_cost: float = 0.0
+
+
+@dataclasses.dataclass(frozen=True)
 class SampleMessage:
     """Produced by sampler_worker, consumed by evaluator_worker."""
 
-    sample: str
+    llm_response: LLMResponse
     island_id: int
-    version_generated: int
     sample_time: float
-    sample_token_usage: tuple[int, int]
-    sample_token_cost: float
+
+
+@dataclasses.dataclass(frozen=True)
+class ExecutionResult:
+    """Result of executing a candidate program in the sandbox."""
+
+    score: float
+    optimized_params: list[float] | None
+    complexity: int | None
+    complexity_detail: dict
 
 
 @dataclasses.dataclass(frozen=True)
@@ -24,16 +41,12 @@ class EvalResult:
     """Result of evaluating a single candidate program.
 
     Returned by ``Evaluator.analyse()`` and used throughout the pipeline.
-    Also serves as the message type on the result queue in distributed mode.
+    Sampling metadata (island_id, timing, token usage) lives in ``SampleMessage``.
     """
 
     function: code_manipulation.ParsedFunction
-    island_id: int | None
-    result_per_test: dict | None
-    sample_time: float | None
+    execution_result: ExecutionResult | None
     evaluate_time: float | None
-    sample_token_usage: tuple[int, int] | None
-    sample_token_cost: float | None
 
 
 @dataclasses.dataclass(frozen=True)

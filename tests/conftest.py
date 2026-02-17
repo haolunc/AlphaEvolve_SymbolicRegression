@@ -2,12 +2,65 @@
 
 import pytest
 
-from alpha_evolve_sr.code_manipulation import EvaluatedProgram, ParsedFunction, Program
+from alpha_evolve_sr.code_manipulation import (
+    EvaluatedProgram,
+    ParsedFunction,
+    Program,
+    text_to_function,
+)
 from alpha_evolve_sr.config import ProgramsDatabaseConfig
+from alpha_evolve_sr.messages import EvalResult, ExecutionResult, LLMResponse, SampleMessage
 
 
-# Keep Function as an alias for backward compatibility in tests.
-Function = ParsedFunction
+# --- Split problem constants (replacing old monolithic SAMPLE_SPEC) ---
+
+SAMPLE_PROMPT = "Test specification for symbolic regression."
+
+SAMPLE_EVALUATE_CODE = '''\
+import numpy as np
+
+def evaluate(data: dict) -> float:
+    """Evaluate the equation."""
+    return -1.0, None
+'''
+
+SAMPLE_EQUATION_CODE = '''\
+def equation(x, params):
+    """Compute output."""
+    return params[0] * x
+'''
+
+SAMPLE_SEED_FUNCTION = text_to_function(SAMPLE_EQUATION_CODE)
+
+
+def make_eval_result(score=-1.0):
+    """Build a valid EvalResult for testing."""
+    func = ParsedFunction(
+        name="equation",
+        args="x, params",
+        body="    return params[0] * x",
+    )
+    return EvalResult(
+        function=func,
+        execution_result=ExecutionResult(
+            score=score, optimized_params=None, complexity=5, complexity_detail={},
+        ),
+        evaluate_time=0.2,
+    )
+
+
+def make_sample_message(island_id=0):
+    """Build a valid SampleMessage for testing."""
+    return SampleMessage(
+        llm_response=LLMResponse(
+            response_text="return x",
+            input_tokens=10,
+            output_tokens=20,
+            token_cost=0.001,
+        ),
+        island_id=island_id,
+        sample_time=0.1,
+    )
 
 
 @pytest.fixture
@@ -41,19 +94,3 @@ def db_config() -> ProgramsDatabaseConfig:
         cluster_sampling_temperature_init=0.1,
         cluster_sampling_temperature_period=20,
     )
-
-
-SAMPLE_SPEC = '''\
-"""Test specification for symbolic regression."""
-import numpy as np
-
-# @evaluate.run
-def evaluate(data: dict) -> float:
-    """Evaluate the equation."""
-    return -1.0, None
-
-# @equation.evolve
-def equation(x, params):
-    """Compute output."""
-    return params[0] * x
-'''

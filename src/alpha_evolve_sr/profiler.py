@@ -172,17 +172,58 @@ class TensorBoardWriter:
 
 
 # ---------------------------------------------------------------------------
-# Component: SampleLogger
+# Public API: Profiler
 # ---------------------------------------------------------------------------
 
-class SampleLogger:
-    """Writes per-sample JSON files and equation Python files."""
+class Profiler:
+    """Orchestrates experiment profiling: TensorBoard, JSON sample logs, and statistics."""
 
-    def __init__(self, json_dir: str):
-        self._json_dir = json_dir
+    def __init__(
+        self,
+        num_islands: int,
+        log_dir: str,
+        max_log_nums: int | None = None,
+        config: ProfilerConfig | None = None,
+    ):
+        self._config = config or ProfilerConfig()
+        self._log_dir = log_dir
+        self._max_log_nums = max_log_nums
+        self._num_samples = 0
+
+        self._tb = TensorBoardWriter(log_dir, self._config)
+
+        # Sample logging (inlined from SampleLogger)
+        self._json_dir = os.path.join(log_dir, "samples")
         os.makedirs(self._json_dir, exist_ok=True)
 
-    def write(self, program: code_manipulation.EvaluatedProgram) -> None:
+        # Statistics tracking (inlined from StatisticsTracker)
+        self._best_score: float = -float("inf")
+        self._best_program_sample_order: int | None = None
+        self._best_program_str: str | None = None
+        self._best_score_per_c: dict[int, float] = {}
+        self._best_progstr_per_c: dict[int, str] = {}
+        self._best_progorder_per_c: dict[int, int] = {}
+        self._success_count: int = 0
+        self._failed_count: int = 0
+        self._tot_sample_time: float = 0.0
+        self._tot_evaluate_time: float = 0.0
+        self._tot_token_cost: float = 0.0
+
+    def register_function(
+        self,
+        program: code_manipulation.EvaluatedProgram,
+        pareto_size: int | None = None,
+    ) -> None:
+        """Register a newly evaluated program for logging."""
+        if self._max_log_nums is not None and self._num_samples >= self._max_log_nums:
+            return
+
+        sample_order: int = program.global_sample_nums
+        if sample_order > self._num_samples:
+            self._num_samples = sample_order
+        self._log_program(program, pareto_size=pareto_size)
+
+    def _write_sample(self, program: code_manipulation.EvaluatedProgram) -> None:
         """Write JSON metadata and equation source file for *program*."""
         sample_order = program.global_sample_nums or 0
         content = {
@@ -204,98 +245,33 @@ class SampleLogger:
         function_path = os.path.join(self._json_dir, f"equation_{sample_order}.py")
         program.save_to_file(function_path)
 
-
-# ---------------------------------------------------------------------------
-# Component: StatisticsTracker
-# ---------------------------------------------------------------------------
-
-class StatisticsTracker:
-    """Tracks aggregate score, complexity, and cost statistics."""
-
-    def __init__(self) -> None:
-        self.best_score: float = -float("inf")
-        self.best_program_sample_order: int | None = None
-        self.best_program_str: str | None = None
-
-        self.best_score_per_c: dict[int, float] = {}
-        self.best_progstr_per_c: dict[int, str] = {}
-        self.best_progorder_per_c: dict[int, int] = {}
-
-        self.success_count: int = 0
-        self.failed_count: int = 0
-        self.tot_sample_time: float = 0.0
-        self.tot_evaluate_time: float = 0.0
-        self.tot_token_cost: float = 0.0
-
-    def update(self, program: code_manipulation.EvaluatedProgram) -> None:
-        """Update statistics with a newly evaluated *program*."""
+    def _update_stats(self, program: code_manipulation.EvaluatedProgram) -> None:
+        """Update aggregate statistics with a newly evaluated *program*."""
         sample_order = program.global_sample_nums or 0
         score = program.score
         complexity = program.complexity
 
-        if score is not None and score > self.best_score:
-            self.best_score = score
-            self.best_program_sample_order = sample_order
-            self.best_program_str = str(program)
+        if score is not None and score > self._best_score:
+            self._best_score = score
+            self._best_program_sample_order = sample_order
+            self._best_program_str = str(program)
 
         if complexity is not None:
-            if complexity not in self.best_score_per_c or score > self.best_score_per_c[complexity]:
-                self.best_score_per_c[complexity] = score
-                self.best_progstr_per_c[complexity] = str(program)
-                self.best_progorder_per_c[complexity] = sample_order
+            if complexity not in self._best_score_per_c or score > self._best_score_per_c[complexity]:
+                self._best_score_per_c[complexity] = score
+                self._best_progstr_per_c[complexity] = str(program)
+                self._best_progorder_per_c[complexity] = sample_order
 
         if score:
-            self.success_count += 1
+            self._success_count += 1
         else:
-            self.failed_count += 1
+            self._failed_count += 1
         if program.sample_time:
-            self.tot_sample_time += program.sample_time
+            self._tot_sample_time += program.sample_time
         if program.evaluate_time:
-            self.tot_evaluate_time += program.evaluate_time
+            self._tot_evaluate_time += program.evaluate_time
         if program.token_cost:
-            self.tot_token_cost += program.token_cost
-
-
-# ---------------------------------------------------------------------------
-# Public API: Profiler
-# ---------------------------------------------------------------------------
-
-class Profiler:
-    """Orchestrates experiment profiling.
-
-    Delegates to ``TensorBoardWriter``, ``SampleLogger``, and
-    ``StatisticsTracker`` for the actual work.
-    """
-
-    def __init__(
-        self,
-        num_islands: int,
-        log_dir: str,
-        max_log_nums: int | None = None,
-        config: ProfilerConfig | None = None,
-    ):
-        self._config = config or ProfilerConfig()
-        self._log_dir = log_dir
-        self._max_log_nums = max_log_nums
-        self._num_samples = 0
-
-        self._tb = TensorBoardWriter(log_dir, self._config)
-        self._sample_logger = SampleLogger(os.path.join(log_dir, "samples"))
-        self._stats = StatisticsTracker()
-
-    def register_function(
-        self,
-        program: code_manipulation.EvaluatedProgram,
-        pareto_size: int | None = None,
-    ) -> None:
-        """Register a newly evaluated program for logging."""
-        if self._max_log_nums is not None and self._num_samples >= self._max_log_nums:
-            return
-
-        sample_order: int = program.global_sample_nums
-        if sample_order > self._num_samples:
-            self._num_samples = sample_order
-        self._log_program(program, pareto_size=pareto_size)
+            self._tot_token_cost += program.token_cost
 
     def _log_program(
         self,
@@ -310,21 +286,21 @@ class Profiler:
             program.global_sample_nums,
         )
 
-        self._sample_logger.write(program)
-        self._stats.update(program)
+        self._write_sample(program)
+        self._update_stats(program)
 
         self._tb.write(
             num_samples=self._num_samples,
-            best_score=self._stats.best_score,
-            best_score_per_c=self._stats.best_score_per_c,
-            best_progorder_per_c=self._stats.best_progorder_per_c,
-            tot_token_cost=self._stats.tot_token_cost,
-            success_count=self._stats.success_count,
-            failed_count=self._stats.failed_count,
-            tot_sample_time=self._stats.tot_sample_time,
-            tot_evaluate_time=self._stats.tot_evaluate_time,
-            cur_best_sample_order=self._stats.best_program_sample_order,
-            cur_best_program_str=self._stats.best_program_str,
+            best_score=self._best_score,
+            best_score_per_c=self._best_score_per_c,
+            best_progorder_per_c=self._best_progorder_per_c,
+            tot_token_cost=self._tot_token_cost,
+            success_count=self._success_count,
+            failed_count=self._failed_count,
+            tot_sample_time=self._tot_sample_time,
+            tot_evaluate_time=self._tot_evaluate_time,
+            cur_best_sample_order=self._best_program_sample_order,
+            cur_best_program_str=self._best_program_str,
             pareto_size=pareto_size,
         )
 
@@ -332,10 +308,10 @@ class Profiler:
         """Writes the best program found for each complexity to a text file."""
         output_path = os.path.join(self._log_dir, "best_programs_per_complexity.txt")
         with open(output_path, "w") as f:
-            for c in sorted(self._stats.best_score_per_c.keys()):
-                score = self._stats.best_score_per_c[c]
-                order = self._stats.best_progorder_per_c[c]
-                prog_str = self._stats.best_progstr_per_c[c]
+            for c in sorted(self._best_score_per_c.keys()):
+                score = self._best_score_per_c[c]
+                order = self._best_progorder_per_c[c]
+                prog_str = self._best_progstr_per_c[c]
                 f.write(f"{c},{score:.4g},{order}\n{prog_str}\n")
         logger.info("Best programs per complexity saved to %s", output_path)
 
@@ -352,6 +328,51 @@ class Profiler:
                 f.write(str(prog))
                 f.write("\n\n")
         logger.info("Pareto front (%d programs) saved to %s", len(pareto_front), output_path)
+
+    # ---- Snapshot / restore for SQLite checkpoint ----
+
+    def get_stats_snapshot(self) -> dict:
+        """Returns a dict of all aggregate counters."""
+        return {
+            "best_score": self._best_score,
+            "best_program_sample_order": self._best_program_sample_order,
+            "best_program_str": self._best_program_str,
+            "success_count": self._success_count,
+            "failed_count": self._failed_count,
+            "tot_sample_time": self._tot_sample_time,
+            "tot_evaluate_time": self._tot_evaluate_time,
+            "tot_token_cost": self._tot_token_cost,
+        }
+
+    def get_best_per_complexity_snapshot(self) -> dict[int, tuple[float, str, int]]:
+        """Returns ``{complexity: (score, prog_str, order)}``."""
+        return {
+            c: (self._best_score_per_c[c], self._best_progstr_per_c[c], self._best_progorder_per_c[c])
+            for c in self._best_score_per_c
+        }
+
+    def restore_stats(
+        self,
+        stats: dict,
+        best_per_c: dict[int, tuple[float, str, int]],
+    ) -> None:
+        """Sets all internal counters from loaded data."""
+        self._best_score = stats.get("best_score", -float("inf"))
+        self._best_program_sample_order = stats.get("best_program_sample_order")
+        self._best_program_str = stats.get("best_program_str")
+        self._success_count = stats.get("success_count", 0)
+        self._failed_count = stats.get("failed_count", 0)
+        self._tot_sample_time = stats.get("tot_sample_time", 0.0)
+        self._tot_evaluate_time = stats.get("tot_evaluate_time", 0.0)
+        self._tot_token_cost = stats.get("tot_token_cost", 0.0)
+
+        self._best_score_per_c = {}
+        self._best_progstr_per_c = {}
+        self._best_progorder_per_c = {}
+        for c, (score, prog_str, order) in best_per_c.items():
+            self._best_score_per_c[c] = score
+            self._best_progstr_per_c[c] = prog_str
+            self._best_progorder_per_c[c] = order
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()

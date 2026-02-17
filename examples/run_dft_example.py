@@ -44,9 +44,13 @@ if __name__ == "__main__":
     if run_config.save_ckpt_dir is None and run_config.log_folder:
         run_config.save_ckpt_dir = "./log/" + run_config.log_folder + "/checkpoints"
 
-    from alpha_evolve_sr.cli import load_data, main_single  # noqa: E402
+    from alpha_evolve_sr.cli import load_problem, main_single  # noqa: E402
     from alpha_evolve_sr.logging_config import configure_logging  # noqa: E402
 
     configure_logging()
-    spec, data_dict = load_data(run_config.spec_path, run_config.data_folder)
-    main_single(run_config, spec, data_dict)
+    prompt_text, evaluate_code, seed_function, data_dict = load_problem(
+        run_config.problem_dir, run_config.data_folder,
+    )
+    main_single(
+        run_config, prompt_text, evaluate_code, seed_function, data_dict,
+    )

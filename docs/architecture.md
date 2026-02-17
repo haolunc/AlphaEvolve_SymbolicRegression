@@ -1,998 +1,654 @@
 # Architecture Document — AlphaEvolve Symbolic Regression
 
-> **Version**: 0.2.0 | **Date**: 2026-02-13 | **Status**: As-Is Analysis + Refactoring Proposal
+> **Version**: 0.3.0 | **Date**: 2026-02-17
 
 ---
 
 ## Table of Contents
 
-1. [System Overview](#1-system-overview)
-2. [Component Responsibilities](#2-component-responsibilities)
-3. [Data Flow](#3-data-flow)
-4. [Class Relationships](#4-class-relationships)
-5. [Sequence Diagrams](#5-sequence-diagrams)
-6. [Issue Inventory](#6-issue-inventory)
-7. [Refactoring Plan](#7-refactoring-plan)
+1. [What This System Does](#1-what-this-system-does) `[conceptual]`
+2. [Architecture at a Glance](#2-architecture-at-a-glance) `[conceptual]`
+3. [The Evolutionary Algorithm](#3-the-evolutionary-algorithm) `[conceptual]`
+4. [Module Map](#4-module-map) `[reference]`
+5. [The Distributed Pipeline](#5-the-distributed-pipeline) `[conceptual]`
+6. [Data Flow Through the Evaluator](#6-data-flow-through-the-evaluator) `[conceptual]`
+7. [Prompt Construction](#7-prompt-construction) `[conceptual]`
+8. [Key Design Patterns](#8-key-design-patterns) `[reference]`
+9. [Configuration Reference](#9-configuration-reference) `[reference]`
+10. [Problem Specification Format](#10-problem-specification-format) `[how-to]`
+11. [Common Extension Points](#11-common-extension-points) `[how-to]`
+12. [Appendix: Import Dependency Matrix](#12-appendix-import-dependency-matrix) `[reference]`
 
 ---
 
-## 1. System Overview
+## 1. What This System Does
 
-<!-- 系统整体是一个 LLM 引导的进化搜索框架，用于符号回归。
-     核心循环：Database 提供 prompt → Sampler 调用 LLM 生成候选方程 → Evaluator 沙箱执行+参数优化 → 结果写回 Database -->
+**Symbolic regression** is the task of discovering a mathematical equation
+that fits observed data. Unlike neural-network regression, the output is a
+*human-readable formula* — compact, interpretable, and amenable to
+scientific insight.
 
-```mermaid
-graph TB
-    subgraph Core Loop
-        DB["ProgramsDatabase<br/>(Island-based EA)"]
-        SAM["LLM Sampler<br/>(OpenAI / Qwen / Gemini)"]
-        EVAL["Evaluator<br/>(Sandbox + Param Optimization)"]
+This system uses **large language models (LLMs)** as the mutation operator
+inside an evolutionary algorithm. Instead of random crossover or point
+mutations on expression trees, an LLM reads a prompt containing
+previously discovered equations (ranked worst-to-best) and proposes a new,
+improved version. The candidate is then executed in a sandbox, scored
+against training data, and inserted into a population database.
 
-        DB -- "1. Prompt<br/>(historical programs)" --> SAM
-        SAM -- "2. Candidate equation<br/>(raw text)" --> EVAL
-        EVAL -- "3. Result<br/>(score, params, complexity)" --> DB
-    end
+**Concrete example.** Given electron-density data from DFT calculations, the
+system discovers a symbolic exchange-correlation energy functional
+`e_xc(rho, s, params)` that minimizes a combined energy + potential loss.
+It starts from a seed (e.g. PBE exchange) and iterates until it finds a
+compact formula that outperforms the seed.
 
-    subgraph Infrastructure
-        CKPT["Checkpoint<br/>(pickle)"]
-        PROF["Profiler<br/>(TensorBoard + JSON)"]
-        LOG["Logging<br/>(console + file)"]
-    end
+The core loop is three stages, repeated thousands of times:
 
-    DB --> CKPT
-    DB --> PROF
-    SAM --> LOG
-    EVAL --> LOG
+```
+Database  ──prompt──▶  LLM Sampler  ──candidate──▶  Evaluator  ──result──▶  Database
+```
 
-    subgraph Orchestration
-        CLI["CLI Entry Point"]
-        CTRL["EvolutionController"]
-        WK["Workers<br/>(multiprocessing)"]
-    end
+---
 
-    CLI --> CTRL
-    CLI --> WK
-    CTRL --> DB
-    WK --> CTRL
-    WK --> SAM
-    WK --> EVAL
+## 2. Architecture at a Glance
 
-    SPEC["Specification File<br/>(user-defined task)"] -.-> CLI
-    DATA["Training Data<br/>(CSV)"] -.-> CLI
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                         CLI  (cli.py:main)                             │
+│  Parses YAML config, loads problem spec + data, picks execution mode   │
+└─────────────┬───────────────────────────────────┬──────────────────────┘
+              │ distributed=True                  │ distributed=False
+              ▼                                   ▼
+┌──────────────────────────┐         ┌───────────────────────────┐
+│   main_distributed()     │         │   main_single()           │
+│   mp.Process workers     │         │   Sequential loop         │
+│   connected by Queues    │         │   in a single process     │
+└──────────────────────────┘         └───────────────────────────┘
+              │                                   │
+              ▼                                   ▼
+┌────────────────────────────────────────────────────────────────────────┐
+│                     Shared Core Components                             │
+│                                                                        │
+│  ProgramsDatabase ◀──▶ Island ◀──▶ Cluster    (database.py)           │
+│  LLM ◀──▶ LLMProvider (ABC)                   (sampler.py)            │
+│  Evaluator ◀──▶ Sandbox                        (evaluator.py)          │
+│  Profiler (TensorBoard + JSON)                 (profiler.py)           │
+│  Checkpoint (pickle DB + YAML config)          (checkpoint.py)         │
+└────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Two Execution Modes
-
-<!-- 系统支持两种运行模式，共享核心组件但编排方式不同 -->
 
 | Mode | Entry Point | Parallelism | Use Case |
 |------|-------------|-------------|----------|
 | **Distributed** | `main_distributed()` | Multiple OS processes via `mp.Process` | Production runs |
 | **Non-distributed** | `main_single()` | Single process, sequential | Debugging / small experiments |
 
----
-
-## 2. Component Responsibilities
-
-<!-- 每个模块的单一职责定义 -->
-
-```mermaid
-graph LR
-    subgraph "Core Domain"
-        CM["code_manipulation.py<br/>─────────────<br/>Python AST parsing<br/>ParsedFunction / EvaluatedProgram<br/>Program dataclass<br/>Token-level code rewriting"]
-        DB2["database.py<br/>─────────────<br/>ProgramsDatabase (top-level)<br/>Island (sub-population)<br/>Cluster (complexity-binned)<br/>Prompt construction"]
-        EV["evaluator.py<br/>─────────────<br/>Code extraction from LLM output<br/>Sandbox subprocess execution<br/>Result packaging"]
-        CX["complexity.py<br/>─────────────<br/>AST-based complexity scoring<br/>Weighted op/func counting"]
-        MSG["messages.py<br/>─────────────<br/>SampleMessage<br/>EvalResult<br/>PerfMessage"]
-    end
-
-    subgraph "Integration"
-        SM["sampler.py<br/>─────────────<br/>LLMProvider interface (ABC)<br/>OpenAI/Qwen/Gemini impls<br/>Retry logic + threading"]
-        CTRL2["controller.py<br/>─────────────<br/>EvolutionController<br/>Database lifecycle<br/>Checkpoint orchestration"]
-        WK2["workers.py<br/>─────────────<br/>database_worker()<br/>sampler_worker()<br/>evaluator_worker()<br/>monitoring_worker()"]
-        CL["cli.py<br/>─────────────<br/>ArgumentParser<br/>main_distributed()<br/>main_single()<br/>Data loading"]
-    end
-
-    subgraph "Support"
-        CF["config.py<br/>─────────────<br/>5 frozen dataclasses<br/>ProgramsDatabaseConfig<br/>SamplerConfig<br/>EvaluatorConfig<br/>ProfilerConfig<br/>WorkerConfig"]
-        CK["checkpoint.py<br/>─────────────<br/>save/load database (pickle)<br/>save/load CLI config (JSON)"]
-        PF["profiler.py<br/>─────────────<br/>TensorBoardWriter<br/>SampleLogger (JSON + .py)<br/>StatisticsTracker"]
-        LC["logging_config.py<br/>─────────────<br/>configure_logging()<br/>get_logger()<br/>setup_file_logger()"]
-        EX["exceptions.py<br/>─────────────<br/>SpecificationError<br/>CheckpointError<br/>LLMProviderError<br/>SandboxTimeoutError<br/>ConfigurationError"]
-    end
-```
-
-### Module Size Distribution
-
-<!-- 模块大小分布反映了复杂度分配 -->
-
-```
-workers.py           ████████████████████████████████████████
-controller.py        ██████████████████████████████
-profiler.py          ████████████████████████████████████
-cli.py               █████████████████████████████████
-code_manipulation.py █████████████████████████████████
-database.py          ████████████████████████████████
-sampler.py           ████████████████████
-evaluator.py         ███████████████████
-complexity.py        ███████████
-messages.py          ███████
-config.py            ██████████
-checkpoint.py        ██████
-logging_config.py    ████
-exceptions.py        ██
-```
+Both modes share the same `ProgramsDatabase`, `LLM`, and `Evaluator` classes. The only difference is orchestration: distributed mode connects workers via `multiprocessing.Queue`; non-distributed mode calls them directly in a loop.
 
 ---
 
-## 3. Data Flow
+## 3. The Evolutionary Algorithm
 
-### 3.1 Distributed Mode — Queue-based Pipeline
+### 3.1 Island Model
 
-<!-- 分布式模式通过 5 个 multiprocessing.Queue 连接 4 类 worker 进程 -->
+The population is partitioned into **N islands** (default 10). Each island
+maintains its own set of programs and produces prompts independently. This
+preserves diversity — different islands can explore different regions of
+the search space without converging prematurely.
 
-```mermaid
-graph LR
-    subgraph "Process: Database Worker (1)"
-        DBW["database_worker()"]
-    end
+Every `reset_period` samples (default 700), the system ranks all islands
+by their best score (plus a tiny noise term for tie-breaking), then
+**resets the bottom 50%**. Each reset island is re-created empty and seeded
+with the best program from a randomly chosen surviving island (the
+"founder"). This ensures weak islands get a fresh start from proven
+genetic material.
 
-    subgraph "Process: Sampler Workers (N)"
-        SW1["sampler_worker(0)"]
-        SW2["sampler_worker(1)"]
-        SWN["sampler_worker(N-1)"]
-    end
+Key method: `ProgramsDatabase.reset_islands()`
 
-    subgraph "Process: Evaluator Workers (M)"
-        EW1["evaluator_worker(0)"]
-        EW2["evaluator_worker(1)"]
-        EWM["evaluator_worker(M-1)"]
-    end
+### 3.2 Complexity-Binned Clusters
 
-    subgraph "Process: Monitor (1)"
-        MON["monitoring_worker()"]
-    end
+Within each island, programs are grouped into **clusters** by an integer
+complexity bin. The complexity of a program is computed via AST analysis
+(`complexity.py`) — counting binary operations, variable references,
+constants, and function calls.
 
-    DBW -- "prompt_queue<br/>Prompt" --> SW1
-    DBW -- "prompt_queue" --> SW2
-    DBW -- "prompt_queue" --> SWN
-
-    SW1 -- "sample_queue<br/>SampleMessage" --> EW1
-    SW2 -- "sample_queue" --> EW2
-    SWN -- "sample_queue" --> EWM
-
-    EW1 -- "result_queue<br/>EvalResult" --> DBW
-    EW2 -- "result_queue" --> DBW
-    EWM -- "result_queue" --> DBW
-
-    EW1 -. "initial_result_queue<br/>(first eval only)" .-> DBW
-
-    SW1 -. "perf_queue<br/>PerfMessage" .-> MON
-    EW1 -. "perf_queue" .-> MON
-    DBW -. "perf_queue" .-> MON
+```
+complexity_bin = program.complexity // complexity_bin_size
 ```
 
-### 3.2 Message Types Flowing Through Queues
+Each cluster stores up to `cluster_max_size` (default 100) programs. When
+a cluster overflows, the lowest-scoring programs are pruned.
 
-<!-- 队列中传递的消息现在全部是 typed dataclasses -->
+When constructing a prompt, the island randomly selects
+`functions_per_prompt` (default 4) clusters, draws one program from each
+via **temperature-scaled softmax sampling** over scores, sorts them
+worst-to-best, and passes them to the LLM as "previous versions".
 
-```mermaid
-graph TD
-    subgraph "prompt_queue"
-        PQ["Prompt (dataclass)<br/>├── code: str<br/>├── version_generated: int<br/>└── island_id: int"]
-    end
+The temperature decays linearly within each period
+(`cluster_sampling_temperature_period`), creating alternating phases of
+exploration (high temperature, more uniform selection) and exploitation
+(low temperature, best programs dominate).
 
-    subgraph "sample_queue (SampleMessage)"
-        SQ["SampleMessage (frozen dataclass)<br/>├── sample: str<br/>├── island_id: int<br/>├── version_generated: int<br/>├── sample_time: float<br/>└── sample_token_usage: tuple[int,int]"]
-    end
+Key classes: `Island`, `Cluster`
 
-    subgraph "result_queue (EvalResult)"
-        RQ["EvalResult (frozen dataclass)<br/>├── function: ParsedFunction<br/>├── island_id: int|None<br/>├── result_per_test: dict|None<br/>│   ├── score: float<br/>│   ├── optimized_params: list<br/>│   ├── complexity: int<br/>│   └── complexity_detail: Counter<br/>├── sample_time: float|None<br/>├── evaluate_time: float|None<br/>└── sample_token_usage: tuple|None"]
-    end
+### 3.3 Pareto Front
 
-    subgraph "perf_queue (PerfMessage)"
-        PERF["PerfMessage (frozen dataclass)<br/>├── worker_type: str<br/>├── worker_id: int<br/>└── stats: dict"]
-    end
-```
+The database maintains a **Pareto front** in the (complexity, score) space.
+A program is *non-dominated* if no other program has both lower-or-equal
+complexity and higher-or-equal score. The front is updated on every
+`register_program()` call.
 
-### 3.3 Backpressure Mechanism
+When `ProgramsDatabaseConfig.pareto_aware = True`, the Pareto front
+influences cluster selection during prompt construction. Clusters whose
+best score lags behind the Pareto-interpolated target at their complexity
+level receive higher selection weight (via `Island._pareto_weights()`).
+This steers exploration toward under-performing complexity regions.
 
-<!-- 背压机制通过两个共享计数器实现，防止队列无限增长 -->
+At finalization, the Pareto front is written to `pareto_front.py` in the
+log directory.
 
-```mermaid
-sequenceDiagram
-    participant DB as Database Worker
-    participant S as Sampler Worker
-    participant E as Evaluator Worker
-
-    Note over DB,S: prompt_pending_count (shared Value)
-    Note over S,E: sample_pending_count (shared Value)
-
-    DB->>DB: Check prompt_pending_count < num_samplers
-    DB->>S: Put prompt → prompt_queue
-    DB->>DB: prompt_pending_count += 1
-
-    S->>S: prompt_pending_count -= 1
-    S->>S: Check sample_pending_count < num_evaluators
-    S->>E: Put sample → sample_queue
-    S->>S: sample_pending_count += 1
-
-    E->>E: sample_pending_count -= 1
-    E->>DB: Put result → result_queue
-```
+Key methods: `ProgramsDatabase._update_pareto_front()`, `Island._pareto_weights()`
 
 ---
 
-## 4. Class Relationships
+## 4. Module Map
 
-### 4.1 Core Domain Classes
+### Tier Diagram
 
-<!-- 核心领域模型的类图 -->
+Modules are organized into four tiers by dependency direction. Higher tiers
+import from lower tiers, never the reverse.
 
-```mermaid
-classDiagram
-    class ParsedFunction {
-        <<frozen>>
-        +str name
-        +str args
-        +str body
-        +str|None return_type
-        +str|None docstring
-        +list|None decorators
-        +__str__() str
-        +save_to_file(filepath, append)
-    }
+```
+Tier 3 — Orchestration (depends on everything below)
+  ┌──────────┐  ┌──────────┐
+  │  cli.py   │  │ workers.py│
+  └──────────┘  └──────────┘
 
-    class EvaluatedProgram {
-        +ParsedFunction parsed
-        +float|None score
-        +list|None optimized_params
-        +int|None complexity
-        +dict|None complexity_detail
-        +int|None global_sample_nums
-        +float|None sample_time
-        +float|None evaluate_time
-        +tuple|None token_usage
-        +float|None token_cost
-        +name: str (property)
-        +__str__() str
-        +save_to_file(filepath, append)
-    }
+Tier 2 — Core Domain (depends on Tier 0–1)
+  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐
+  │  database.py  │  │  evaluator.py │  │  sampler.py   │
+  └──────────────┘  └──────────────┘  └──────────────┘
 
-    class Program {
-        <<frozen>>
-        +str preface
-        +list~ParsedFunction~ functions
-        +__str__() str
-        +find_function_index(name) int
-        +get_function(name) ParsedFunction
-    }
+Tier 1 — Support (depends on Tier 0)
+  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐  ┌────────────┐
+  │ profiler.py   │  │ checkpoint.py │  │ code_manipulation.py│  │complexity.py│
+  └──────────────┘  └──────────────┘  └────────────────────┘  └────────────┘
 
-    class Prompt {
-        +str code
-        +int version_generated
-        +int island_id
-    }
-
-    class ProgramsDatabase {
-        -ProgramsDatabaseConfig _config
-        -list~Island~ _islands
-        -list~float~ _best_score_per_island
-        -list~EvaluatedProgram|None~ _best_program_per_island
-        -int _last_reset_step
-        -Profiler _profiler
-        -int _global_sample_nums
-        +get_prompt() Prompt
-        +register_program(program, island_id, ...)
-        +reset_islands()
-        +sample_count: int (property)
-        +finalize()
-    }
-
-    class Island {
-        -Program _template
-        -str _function_to_evolve
-        -int _functions_per_prompt
-        -int _complexity_bin_size
-        -dict~int,Cluster~ _clusters
-        -int _num_programs
-        +num_clusters: int (property)
-        +num_programs: int (property)
-        +register_program(program)
-        +get_prompt(temperature) tuple
-        -_generate_prompt(implementations) str
-    }
-
-    class Cluster {
-        -int _complexity_bin
-        -int _max_size
-        -list~EvaluatedProgram~ _programs
-        -list~float~ _scores
-        +register_program(program)
-        +sample_program(temperature) EvaluatedProgram
-        -_prune()
-    }
-
-    EvaluatedProgram *-- ParsedFunction : contains (parsed)
-    ProgramsDatabase *-- Island : contains N
-    Island *-- Cluster : contains by complexity_bin
-    Cluster o-- EvaluatedProgram : stores programs
-    ProgramsDatabase ..> Prompt : creates
-    Island ..> Program : uses template
-    Program *-- ParsedFunction : contains
+Tier 0 — Foundation (no intra-package dependencies, or only logging/config)
+  ┌────────────┐  ┌────────────────┐  ┌──────────────┐  ┌──────────────┐
+  │  config.py  │  │logging_config.py│  │ exceptions.py │  │  messages.py  │
+  └────────────┘  └────────────────┘  └──────────────┘  └──────────────┘
 ```
 
-### 4.2 Sampler Layer
+### Module Reference
 
-<!-- Sampler 使用策略模式支持多 LLM 提供商 -->
-
-```mermaid
-classDiagram
-    class LLMProvider {
-        <<abstract>>
-        +generate(prompt, config) LLMResponse*
-    }
-
-    class LLMResponse {
-        +str response_text
-        +int input_tokens
-        +int output_tokens
-    }
-
-    class OpenAIProvider {
-        +generate(prompt, config) LLMResponse
-    }
-
-    class QwenProvider {
-        +generate(prompt, config) LLMResponse
-    }
-
-    class GeminiProvider {
-        +generate(prompt, config) LLMResponse
-    }
-
-    class LLM {
-        -int _samples_per_prompt
-        -SamplerConfig _config
-        -LLMProvider _provider
-        -ThreadPoolExecutor _executor
-        +draw_samples(prompt) Collection~LLMResponse~|None
-        +clean()
-        -_query_with_retry(prompt) LLMResponse|None
-    }
-
-    LLMProvider <|-- OpenAIProvider
-    LLMProvider <|-- QwenProvider
-    LLMProvider <|-- GeminiProvider
-    LLM --> LLMProvider : uses
-    LLM --> SamplerConfig : configured by
-    LLMProvider ..> LLMResponse : returns
-
-    note for LLM "ThreadPoolExecutor is persistent\n(created in __init__)"
-```
-
-### 4.3 Evaluator + Sandbox
-
-<!-- Evaluator 在沙箱子进程中执行 LLM 生成的代码 -->
-
-```mermaid
-classDiagram
-    class Evaluator {
-        -Program _template
-        -str _function_to_evolve
-        -str _function_to_run
-        -dict _data_dict
-        -EvaluatorConfig _config
-        -Sandbox _sandbox
-        +analyse(sample, island_id, ...) EvalResult|None
-        +clean()
-    }
-
-    class Sandbox {
-        -Pool|None _pool
-        +run(program, func, data, timeout) tuple
-        +clean()
-    }
-
-    Evaluator *-- Sandbox : owns
-    Evaluator --> Program : uses template
-    Evaluator --> EvaluatorConfig : configured by
-
-    note for Sandbox "Uses mp.get_context('spawn').Pool\nto isolate exec() calls.\nPool is persistent (lazy creation,\nkill-and-recreate on timeout)."
-```
-
-### 4.4 Profiler Decomposition
-
-<!-- Profiler 内部已做了良好的职责拆分 -->
-
-```mermaid
-classDiagram
-    class Profiler {
-        -ProfilerConfig _config
-        -str _log_dir
-        -int _num_samples
-        -TensorBoardWriter _tb
-        -SampleLogger _sample_logger
-        -StatisticsTracker _stats
-        +register_function(program)
-        +write_best_program_per_c_file()
-    }
-
-    class TensorBoardWriter {
-        -SummaryWriter _writer
-        -str _log_dir
-        -ProfilerConfig _config
-        +write(num_samples, best_score, ...)
-    }
-
-    class SampleLogger {
-        -str _json_dir
-        +write(program)
-    }
-
-    class StatisticsTracker {
-        +float best_score
-        +dict best_score_per_c
-        +int success_count
-        +int failed_count
-        +float tot_token_cost
-        +update(program)
-    }
-
-    Profiler *-- TensorBoardWriter
-    Profiler *-- SampleLogger
-    Profiler *-- StatisticsTracker
-```
-
-### 4.5 Configuration Hierarchy
-
-```mermaid
-classDiagram
-    class ProgramsDatabaseConfig {
-        <<frozen>>
-        +int functions_per_prompt = 4
-        +int num_islands = 10
-        +int reset_period = 700
-        +float cluster_sampling_temperature_init = 0.005
-        +int cluster_sampling_temperature_period = 200
-        +int complexity_bin_size = 10
-        +int cluster_max_size = 100
-    }
-
-    class SamplerConfig {
-        <<frozen>>
-        +str provider = "qwen"
-        +str|None model_name = None
-        +float temperature = 1.0
-        +int max_retries = 5
-        +float retry_delay_seconds = 5.0
-        +int request_timeout_seconds = 180
-        +tuple cost_per_ktoken = (0.006, 0.024)
-    }
-
-    class EvaluatorConfig {
-        <<frozen>>
-        +int timeout_seconds = 400
-    }
-
-    class ProfilerConfig {
-        <<frozen>>
-        +int log_frequency = 100
-        +int complexity_group_size = 5
-    }
-
-    class WorkerConfig {
-        <<frozen>>
-        +int perf_report_interval_seconds = 150
-        +int monitor_interval_seconds = 300
-    }
-```
+| Module | Lines | Tier | Responsibility | Key Public API |
+|--------|------:|------|----------------|----------------|
+| `database.py` | 528 | 2 | Evolutionary algorithm: population management, island model, prompt construction | `ProgramsDatabase`, `Island`, `Cluster`, `Prompt` |
+| `workers.py` | 388 | 3 | Multiprocessing workers for distributed mode | `database_worker()`, `sampler_worker()`, `evaluator_worker()`, `monitoring_worker()` |
+| `code_manipulation.py` | 340 | 1 | Python AST parsing and token-level code rewriting | `ParsedFunction`, `EvaluatedProgram`, `Program`, `text_to_function()`, `rename_function_calls()` |
+| `profiler.py` | 337 | 1 | TensorBoard metrics, JSON sample logs, statistics tracking | `Profiler`, `TensorBoardWriter` |
+| `cli.py` | 280 | 3 | Entry point: arg parsing, config loading, mode dispatch | `main()`, `main_distributed()`, `main_single()`, `load_problem()` |
+| `evaluator.py` | 230 | 2 | Sandbox code execution and scoring | `Evaluator`, `Sandbox` |
+| `config.py` | 216 | 0 | Frozen config dataclasses, YAML serialization | `RunConfig`, `ProgramsDatabaseConfig`, `SamplerConfig`, `EvaluatorConfig`, `ProfilerConfig`, `WorkerConfig` |
+| `sampler.py` | 211 | 2 | LLM provider abstraction with retry logic | `LLM`, `LLMProvider` (ABC), `OpenAIProvider`, `QwenProvider`, `GeminiProvider` |
+| `complexity.py` | 118 | 1 | AST-based complexity scoring with weighted op/func counting | `complexity_score()`, `ComplexityVisitor` |
+| `checkpoint.py` | 58 | 1 | Pickle-based database persistence, YAML config save/load | `save_checkpoint()`, `load_checkpoint()`, `save_config()`, `load_config()` |
+| `messages.py` | 45 | 0 | Typed dataclasses for inter-worker queue messages | `SampleMessage`, `EvalResult`, `PerfMessage` |
+| `logging_config.py` | 45 | 0 | Unified logging setup | `configure_logging()`, `get_logger()`, `setup_file_logger()` |
+| `exceptions.py` | 13 | 0 | Custom exception hierarchy | `AlphaEvolveSRError`, `LLMProviderError`, `CheckpointError` |
 
 ---
 
-## 5. Sequence Diagrams
+## 5. The Distributed Pipeline
 
-### 5.1 Main Evolution Loop (Non-Distributed)
+### 5.1 Queue Topology
 
-<!-- 非分布式模式的完整执行流程 -->
+Four types of worker processes communicate through five `multiprocessing.Queue` instances:
 
-```mermaid
-sequenceDiagram
-    participant CLI as cli.main_single()
-    participant DB as ProgramsDatabase
-    participant ISL as Island
-    participant LLM as LLM Sampler
-    participant EVAL as Evaluator
-    participant SB as Sandbox (subprocess)
-    participant PROF as Profiler
-
-    CLI->>EVAL: analyse(initial_body)
-    EVAL->>SB: run(program, func, data, timeout)
-    SB-->>EVAL: (result, success)
-    EVAL-->>CLI: EvalResult
-    CLI->>DB: register_program(initial)
-
-    loop Until max_samples reached
-        CLI->>DB: get_prompt()
-        DB->>ISL: get_prompt(temperature)
-        ISL->>ISL: Select clusters → sample programs
-        ISL->>ISL: _generate_prompt(sorted implementations)
-        ISL-->>DB: (prompt_code, version_generated)
-        DB-->>CLI: Prompt(code, version, island_id)
-
-        CLI->>LLM: draw_samples(prompt.code)
-        LLM->>LLM: _query_with_retry()
-        LLM-->>CLI: [LLMResponse, ...]
-
-        loop For each sample
-            CLI->>EVAL: analyse(sample, island_id, version)
-            EVAL->>EVAL: _extract_python(text)
-            EVAL->>EVAL: _sample_to_program(body, template)
-            EVAL->>SB: run(program, func, data, timeout)
-            Note over SB: exec() in spawned subprocess<br/>JAX JIT compilation<br/>BFGS + CMA-ES optimization
-            SB-->>EVAL: (score, optimized_params) or None
-            EVAL->>EVAL: complexity_score(function)
-            EVAL-->>CLI: EvalResult or None
-
-            CLI->>DB: register_program(func, island_id, result)
-            DB->>ISL: register_program(func)
-            ISL->>ISL: Route to Cluster by complexity_bin
-            DB->>PROF: register_function(func)
-            PROF->>PROF: Write JSON + TensorBoard
-
-            opt Every reset_period samples
-                DB->>DB: reset_islands()
-                Note over DB: Rank islands by best score<br/>Reset bottom 50%<br/>Seed with founder from survivors
-            end
-        end
-    end
-
-    CLI->>PROF: write_best_program_per_c_file()
+```
+                    prompt_queue                 sample_queue
+  ┌─────────────┐ ─────────────▶ ┌────────────┐ ─────────────▶ ┌──────────────┐
+  │  Database    │               │ Sampler(0) │               │ Evaluator(0) │
+  │  Worker (1)  │               │ Sampler(1) │               │ Evaluator(1) │
+  │              │ ◀───────────── │    ...     │               │     ...      │
+  └──────┬───┬──┘  result_queue  │ Sampler(N) │               │ Evaluator(M) │
+         │   │                   └─────┬──────┘               └──────┬───────┘
+         │   │                         │         perf_queue          │
+         │   │    initial_result_queue  │    ┌──────────────────┐    │
+         │   │◀────────────────────────│────│  Monitor (1)     │◀───│
+         │   │                         └───▶│                  │◀───┘
+         │   └─────────────────────────────▶│                  │
+         └─────────────────────────────────▶│                  │
+                                            └──────────────────┘
 ```
 
-### 5.2 Distributed Mode — Process Lifecycle
+### 5.2 Process Startup Sequence
 
-<!-- 分布式模式的进程生命周期管理 -->
+1. `main_distributed()` creates all queues and shared counters
+2. Start **Monitor** process (`monitoring_worker`)
+3. Start **M Evaluator** processes (`evaluator_worker`); evaluator 0 evaluates the initial seed program
+4. Sleep 2 seconds to allow initial evaluation to complete
+5. Start **Database Worker** (`database_worker`); blocks on `initial_result_queue` or restores from checkpoint
+6. Start **N Sampler** processes (`sampler_worker`)
+7. Main process polls `termination_event` every 5 seconds
+8. On termination: close queues, join processes (10 s timeout), terminate stragglers
 
-```mermaid
-sequenceDiagram
-    participant MAIN as cli.main_distributed()
-    participant MON as Monitor Process
-    participant EW as Evaluator Workers [0..M-1]
-    participant DBW as Database Worker
-    participant SW as Sampler Workers [0..N-1]
+### 5.3 Message Types
 
-    MAIN->>MON: mp.Process(monitoring_worker).start()
-    MAIN->>EW: mp.Process(evaluator_worker).start() x M
-    Note over EW: evaluator_worker(0) processes<br/>initial program evaluation
-    MAIN->>MAIN: sleep(2) — wait for initial eval
+| Queue | Message Type | Producer | Consumer | Fields |
+|-------|-------------|----------|----------|--------|
+| `prompt_queue` | `Prompt` | Database Worker | Sampler Workers | `code`, `version_generated`, `island_id` |
+| `sample_queue` | `SampleMessage` | Sampler Workers | Evaluator Workers | `sample`, `island_id`, `version_generated`, `sample_time`, `sample_token_usage`, `sample_token_cost` |
+| `result_queue` | `EvalResult` | Evaluator Workers | Database Worker | `function`, `island_id`, `result_per_test`, `sample_time`, `evaluate_time`, `sample_token_usage`, `sample_token_cost` |
+| `initial_result_queue` | `EvalResult` | Evaluator 0 | Database Worker | (same as above — used only once at startup) |
+| `perf_queue` | `PerfMessage` | All Workers | Monitor | `worker_type`, `worker_id`, `stats` |
 
-    EW-->>DBW: initial_result_queue.put(result)
+### 5.4 Backpressure Mechanism
 
-    MAIN->>DBW: mp.Process(database_worker).start()
-    Note over DBW: Blocks on initial_result_queue.get()<br/>or loads from checkpoint
+Two `multiprocessing.Value` counters prevent queues from growing without
+bound:
 
-    MAIN->>SW: mp.Process(sampler_worker).start() x N
+- **`prompt_pending_count`** — incremented by Database Worker on put,
+  decremented by Sampler on get. The Database Worker will not enqueue a
+  new prompt while `prompt_pending_count >= num_samplers`.
 
-    loop Until termination_event.is_set()
-        DBW->>SW: prompt_queue.put(prompt)
-        SW->>EW: sample_queue.put(SampleMessage)
-        EW->>DBW: result_queue.put(EvalResult)
+- **`sample_pending_count`** — incremented by Sampler on put, decremented
+  by Evaluator on get. A Sampler will not enqueue a new sample while
+  `sample_pending_count >= num_evaluators` (sleeps 3 s and retries).
 
-        opt global_sample_nums >= max_samples
-            DBW->>DBW: termination_event.set()
-        end
-    end
-
-    MAIN->>MAIN: Close all queues
-    MAIN->>MAIN: Join/terminate all processes
-```
-
-### 5.3 Prompt Construction Detail
-
-<!-- Prompt 构造是核心竞争力所在，值得详细展开 -->
-
-```mermaid
-sequenceDiagram
-    participant ISL as Island
-    participant CL as Cluster
-    participant CM as code_manipulation
-
-    ISL->>ISL: Choose clusters randomly
-    loop For each chosen cluster
-        ISL->>CL: sample_program(temperature)
-        CL->>CL: softmax(scores / temperature)
-        CL->>CL: np.random.choice(programs, p=probabilities)
-        CL-->>ISL: EvaluatedProgram (with score)
-    end
-
-    ISL->>ISL: Sort by score (ascending)
-
-    loop For i, implementation in enumerate(sorted)
-        ISL->>ISL: Rename to equation_v{i}
-        ISL->>CM: rename_function_calls(old_name → new_name)
-        ISL->>ISL: Update docstring for v1+
-    end
-
-    ISL->>ISL: Extract task docstring from template.preface
-    ISL->>ISL: Build header for equation_v{N} (next version)
-
-    Note over ISL: Final prompt structure:<br/>1. Task description<br/>2. Rules (preserve signature, etc.)<br/>3. Previous versions v0..v{N-1}<br/>4. "Now define: equation_v{N}"
-```
-
-### 5.4 Island Reset Mechanism
-
-```mermaid
-sequenceDiagram
-    participant DB as ProgramsDatabase
-    participant ISL_W as Weak Islands (bottom 50%)
-    participant ISL_S as Strong Islands (top 50%)
-
-    Note over DB: Triggered every reset_period samples
-
-    DB->>DB: Rank islands by best_score + noise
-    DB->>DB: Split into weak/strong halves
-
-    loop For each weak island
-        DB->>ISL_W: Replace with new Island()
-        DB->>ISL_S: Pick random strong island
-        ISL_S-->>DB: best_program (founder)
-        DB->>ISL_W: register_program(founder)
-        Note over ISL_W: New island starts with<br/>one high-quality seed program
-    end
-```
+This keeps each queue at most one item per downstream consumer, ensuring
+that slow consumers are not overwhelmed.
 
 ---
 
-## 6. Issue Inventory
+## 6. Data Flow Through the Evaluator
 
-<!-- 问题清单，按严重程度和模块分类 -->
+The `Evaluator.analyse()` method transforms raw LLM text into a scored
+`EvalResult` in these steps:
 
-### P0 — Runtime Bugs
+1. **Extract Python code** — `_extract_python(text)` strips the
+   `` ```python `` fences from the LLM response. If no fences are found,
+   the raw text is used as-is.
 
-| # | Module | Line | Issue | Impact |
-|---|--------|------|-------|--------|
-| 1 | `cli.py` | 214 | ~~`main_single` 用 `sample_info[0]` 访问 dict~~  | ✅ RESOLVED — uses `sample_info["response_text"]` + `None` guard |
-| 2 | `code_manipulation.py` | 194 | ~~使用 `ast.Str`（Python 3.12 已移除）~~ | ✅ RESOLVED — replaced with `ast.Constant` + `isinstance(value, str)` |
+2. **Parse to function** — `code_manipulation.text_to_function()` parses
+   the extracted code into a `ParsedFunction` via Python's `ast` module.
 
-### P1 — Encapsulation Violations
+3. **Assemble runnable program** — `_sample_to_program()` splices the new
+   function body into the `evaluate.py` template, producing a complete
+   Python script that defines both `equation()` and `evaluate()`.
 
-| # | Module | Line | Issue |
-|---|--------|------|-------|
-| 3 | `workers.py` | 38, 125 | ~~访问 `db._global_sample_nums`~~ | ✅ RESOLVED — uses `db.sample_count` property |
-| 4 | `workers.py` | 159 | ~~访问 `db._profiler.write_best_program_per_c_file()`~~ | ✅ RESOLVED — uses `db.finalize()` |
-| 5 | `cli.py` | 188, 235 | ~~访问 `database._global_sample_nums`~~ | ✅ RESOLVED — uses `database.sample_count` property |
-| 6 | `cli.py` | 241 | ~~访问 `database._profiler.write_best_program_per_c_file()`~~ | ✅ RESOLVED — uses `database.finalize()` |
-| 7 | `database.py` | 139 | ~~访问 `island._clusters`, `island._num_programs`~~ | ✅ RESOLVED — uses `island.num_clusters`, `island.num_programs` properties |
+4. **Sandbox execution** — `Sandbox.run()` sends the assembled program to
+   a spawned subprocess pool (`mp.get_context("spawn").Pool(1)`). The
+   subprocess calls `exec()` on the program, JIT-compiles via JAX, runs
+   the `evaluate()` function against the training data, and returns
+   `(score, optimized_params)`.
 
-### P2 — Design Smells
+5. **Timeout handling** — if the subprocess exceeds
+   `EvaluatorConfig.timeout_seconds` (default 400), the pool is killed
+   and transparently recreated on the next call.
 
-| # | Issue | Affected Modules |
-|---|-------|-----------------|
-| 8 | ~~`Function` dataclass 混合了 3 种关注点 (14 fields)~~ | ✅ RESOLVED — split into `ParsedFunction` (frozen, 6 fields) + `EvaluatedProgram` (10 eval/runtime fields) |
-| 9 | ~~`Function.__setattr__` 隐式修改入参~~ | ✅ RESOLVED — `value: object` type hint + `isinstance` guards |
-| 10 | ~~`exceptions.py` 定义了 5 个异常但从未使用~~ | ✅ RESOLVED — `SpecificationError`, `CheckpointError`, `LLMProviderError` wired up |
-| 11 | ~~Queue 消息为 raw dict，无类型合约~~ | ✅ RESOLVED — `SampleMessage`, `EvalResult`, `PerfMessage` dataclasses in `messages.py` |
-| 12 | ~~Workers 用 `object` 类型标注~~ | ✅ RESOLVED — `argparse.Namespace`, `code_manipulation.Program`, `logging.Logger` |
-| 13 | ~~`SamplerConfig` 未传递给 worker 进程~~ | ✅ RESOLVED — CLI args `--llm_provider/model/temperature` → `SamplerConfig` → workers |
-| 14 | ~~`ThreadPoolExecutor` 每次 `draw_samples` 重建~~ | ✅ RESOLVED — persistent executor created in `__init__` |
-| 15 | ~~`load_dotenv()` 在模块导入时执行~~ | ✅ RESOLVED — moved to `LLM.__init__` |
+6. **Complexity scoring** — on success, `complexity_score()` walks the
+   AST of the new function to compute an integer complexity and a
+   breakdown `Counter`.
 
-### P3 — Reliability / Resource
+7. **Package result** — an `EvalResult` dataclass is returned with the
+   `ParsedFunction`, score, optimized params, complexity, and timing
+   metadata.
 
-| # | Issue | Module | Line |
-|---|-------|--------|------|
-| 16 | ~~`Cluster` 无限增长，无剪枝机制~~ | ~~`database.py`~~ | ✅ RESOLVED — `Cluster` accepts `max_size` (default 100) and prunes lowest-scoring programs |
-| 17 | ~~Monitoring worker 硬编码日志路径 `"./logger"`~~ | ~~`workers.py`~~ | ✅ RESOLVED — uses `args.log_path` with `"./logger"` fallback |
-| 18 | ~~Profiler 计数逻辑在乱序 sample 下会丢失~~ | ~~`profiler.py`~~ | ✅ RESOLVED — high-water mark tracking; all samples logged unconditionally |
-| 19 | Pickle checkpoint 对类重命名/移动脆弱 | `checkpoint.py` | — |
+> **Warning:** The sandbox uses `exec()` to run LLM-generated code. It
+> runs in a separate *process* (not just a thread) to provide isolation,
+> but there is no OS-level sandboxing (no containers, no seccomp). Do
+> not run this system on untrusted LLM outputs in a production
+> environment without additional safeguards.
 
-### P4 — Security
+### Sandbox Design Rationale
 
-| # | Issue | Module |
-|---|-------|--------|
-| 20 | `exec()` 沙箱无文件系统/网络/内存限制 | `evaluator.py` |
+The `Sandbox` uses a **persistent, lazily-created** `mp.Pool(1)`:
 
-### New Issues (Post-Refactoring)
-
-| # | Sev | Issue | Status |
-|---|-----|-------|--------|
-| 21 | P2 | `Evaluator.analyse()` returns raw `dict\|None` — last untyped boundary | ✅ RESOLVED — returns `EvalResult` |
-| 22 | P2 | Sandbox creates/destroys `mp.Pool` per evaluation (~3600 cycles/run) | ✅ RESOLVED — persistent pool (lazy creation, kill-and-recreate on timeout) |
-| 23 | P2 | No Pareto-aware selection — score only, complexity unused in ranking | Being implemented |
-| 24 | P2 | Duplicated orchestration in `main_single` vs `database_worker` (~70% overlap) | ✅ RESOLVED — `EvolutionController` |
-| 25 | P3 | `_generate_prompt()` does `copy.deepcopy` per prompt | ✅ RESOLVED — uses `dataclasses.replace()` |
-| 26 | P3 | `LLM._query_with_retry` returns raw dict, discards typed `LLMResponse` | ✅ RESOLVED — returns `LLMResponse` |
-| 27 | P3 | Specification uses DFT-specific prompt templates | Open |
-| 28 | P3 | Zero test coverage for `evaluator.py` | ✅ RESOLVED — tests in `test_evaluator.py` |
+- **Lazy creation** avoids startup cost until the first evaluation.
+- **Pool reuse** avoids the ~1–3 s overhead of spawning a new process per
+  evaluation.
+- **Kill-and-recreate on failure** handles timeouts and crashes gracefully
+  without corrupting state.
 
 ---
 
-## 7. Refactoring Plan
+## 7. Prompt Construction
 
-<!-- 重构方案分三个阶段，每个阶段内保持系统可运行 -->
+The prompt sent to the LLM is assembled by `Island._generate_prompt()`.
+It follows a structured template designed to guide the LLM toward
+producing improved equations.
 
-### Phase 1: Fix Bugs + Improve Type Safety ✅ COMPLETE
-
-<!-- 第一阶段：修 bug、加类型、不改架构 -->
-
-**Goal**: Fix runtime bugs and make the codebase type-safe without changing architecture.
+### Template Structure
 
 ```
-Estimated effort: 1-2 days
-Risk: Low — no architectural changes
-Status: ✅ COMPLETE
+┌─────────────────────────────────────────────────────────┐
+│  1. Task Description (from specs/<problem>/prompt.txt)  │
+│     "Develop a compact and physically interpretable..." │
+├─────────────────────────────────────────────────────────┤
+│  2. Rules                                               │
+│     - Preserve the full function signature              │
+│     - Only output equation_v{N} in ```python```         │
+│     - Add inline comments explaining each term          │
+├─────────────────────────────────────────────────────────┤
+│  3. Previous versions (sorted worst → best)             │
+│     ```python                                           │
+│     def equation_v0(rho, s, params):                    │
+│         """..."""                                        │
+│         ...   # (score: -0.85)                          │
+│                                                         │
+│     def equation_v1(rho, s, params):                    │
+│         """Improved version of equation_v0."""           │
+│         ...   # (score: -0.42)                          │
+│                                                         │
+│     def equation_v2(rho, s, params):                    │
+│         """Improved version of equation_v1."""           │
+│         ...   # (score: -0.15)                          │
+│     ```                                                 │
+├─────────────────────────────────────────────────────────┤
+│  4. Completion target                                   │
+│     "Now define:"                                       │
+│     ```python                                           │
+│     def equation_v3(rho, s, params):                    │
+│         """Improved version of equation_v2."""           │
+│     ```                                                 │
+└─────────────────────────────────────────────────────────┘
 ```
 
-#### 1.1 Fix P0 Bugs ✅
+### How Previous Versions Are Selected
+
+1. **Choose clusters** — `functions_per_prompt` clusters are selected
+   randomly (uniform, or Pareto-weighted if `pareto_aware=True`).
+2. **Sample one program per cluster** — softmax over scores with the
+   current temperature.
+3. **Sort by score** (ascending, so the best program is last).
+4. **Rename** — each program is renamed to `equation_v{i}` and internal
+   recursive calls are updated via `code_manipulation.rename_function_calls()`.
+5. **Add docstrings** — versions 1+ get `"Improved version of equation_v{i-1}."`.
+6. **Build the "next version" header** — an empty `equation_v{N}` with
+   the appropriate docstring is appended as the completion target.
+
+The key insight is that presenting programs worst-to-best creates an
+implicit gradient for the LLM: it sees a progression of improving
+solutions and is asked to continue the trend.
+
+---
+
+## 8. Key Design Patterns
+
+- **Frozen dataclasses for configuration** — all config classes except
+  `RunConfig` are `@dataclass(frozen=True)`, preventing accidental
+  mutation after construction. `RunConfig` is mutable because the CLI
+  needs to set derived fields (`log_path`, `save_ckpt_dir`) and override
+  `resume_from_ckpt` after loading.
+
+- **ABC + factory for LLM providers** — `LLMProvider` is an abstract
+  base class. Concrete implementations (`OpenAIProvider`,
+  `QwenProvider`, `GeminiProvider`) are registered in the `_PROVIDERS`
+  dict and instantiated by `_make_provider(name)`.
+
+- **Lazy process pool** — `Sandbox._ensure_pool()` creates the subprocess
+  pool on first use. On timeout or crash,
+  `Sandbox._kill_and_recreate()` terminates and nullifies it so the
+  next call creates a fresh pool.
+
+- **Pickle-safe TensorBoard** — `TensorBoardWriter.__getstate__` drops
+  the `SummaryWriter` (which holds open file handles), and
+  `__setstate__` recreates it. This allows the entire
+  `ProgramsDatabase` (which owns a `Profiler`) to be pickled for
+  checkpointing.
+
+- **Backpressure via shared counters** — two `multiprocessing.Value("i")`
+  counters (`prompt_pending_count`, `sample_pending_count`) throttle
+  producers when downstream consumers are saturated (see
+  [Section 5.4](#54-backpressure-mechanism)).
+
+- **Database absorbs controller** — lifecycle management (checkpoint
+  timing, termination detection, `restore_or_create()`) lives directly
+  in `ProgramsDatabase` rather than in a separate controller class.
+  This eliminates a layer of indirection and reduces inter-module
+  coupling.
+
+---
+
+## 9. Configuration Reference
+
+All configuration is loaded from a single YAML file via `RunConfig.from_yaml()`.
+
+> **Note:** `RunConfig` is the only mutable config dataclass. The CLI
+> sets `log_path` and `save_ckpt_dir` after construction, and may
+> override `resume_from_ckpt` from command-line arguments.
+
+<details>
+<summary><strong>RunConfig</strong> — top-level pipeline configuration</summary>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `problem_dir` | `str \| None` | `None` | Path to the problem specification directory |
+| `data_folder` | `str \| None` | `None` | Path to the training data directory |
+| `log_folder` | `str \| None` | `None` | Base name for the log directory |
+| `log_path` | `str \| None` | `None` | Full path to the log directory (derived from `log_folder`) |
+| `problem_name` | `str` | `"oscillator1"` | Human-readable problem identifier |
+| `max_samples` | `int` | `3600` | Stop after this many total evaluations |
+| `distributed` | `bool` | `True` | Whether to use multiprocessing |
+| `num_samplers` | `int` | `8` | Number of sampler worker processes |
+| `num_evaluators` | `int` | `8` | Number of evaluator worker processes |
+| `save_ckpt_dir` | `str \| None` | `None` | Directory for checkpoint files (derived from `log_folder`) |
+| `save_ckpt_interval` | `int` | `300` | Checkpoint interval in seconds |
+| `resume_from_ckpt` | `str \| None` | `None` | Path to a checkpoint directory to resume from |
+| `sampler` | `SamplerConfig` | (defaults) | Nested sampler configuration |
+| `database` | `ProgramsDatabaseConfig` | (defaults) | Nested database configuration |
+| `evaluator` | `EvaluatorConfig` | (defaults) | Nested evaluator configuration |
+| `profiler` | `ProfilerConfig` | (defaults) | Nested profiler configuration |
+| `worker` | `WorkerConfig` | (defaults) | Nested worker configuration |
+
+</details>
+
+<details>
+<summary><strong>ProgramsDatabaseConfig</strong> — evolutionary algorithm parameters</summary>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `functions_per_prompt` | `int` | `4` | Number of previous programs to include in each prompt |
+| `num_islands` | `int` | `10` | Number of islands for diversity |
+| `reset_period` | `int` | `700` | Reset the weakest islands every N samples |
+| `cluster_sampling_temperature_init` | `float` | `0.005` | Initial softmax temperature for cluster sampling |
+| `cluster_sampling_temperature_period` | `int` | `200` | Period of linear temperature decay |
+| `complexity_bin_size` | `int` | `10` | Width of each complexity bin |
+| `cluster_max_size` | `int` | `100` | Maximum programs per cluster before pruning |
+| `pareto_aware` | `bool` | `False` | Weight cluster selection by Pareto improvement potential |
+
+</details>
+
+<details>
+<summary><strong>SamplerConfig</strong> — LLM request parameters</summary>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `provider` | `str` | `"qwen"` | LLM provider name (`"qwen"`, `"openai"`, or `"gemini"`) |
+| `model_name` | `str \| None` | `None` | Model identifier; `None` uses the provider default |
+| `temperature` | `float` | `1.0` | Sampling temperature for the LLM |
+| `max_retries` | `int` | `5` | Maximum retry attempts per request |
+| `retry_delay_seconds` | `float` | `5.0` | Delay between retries |
+| `request_timeout_seconds` | `int` | `180` | Timeout for a single LLM request |
+| `samples_per_prompt` | `int` | `1` | Number of completions to draw per prompt |
+| `cost_per_ktoken` | `list[float]` | `[0.006, 0.024]` | Cost per 1K tokens `[input, output]` for tracking |
+
+</details>
+
+<details>
+<summary><strong>EvaluatorConfig</strong> — sandbox execution parameters</summary>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `timeout_seconds` | `int` | `400` | Maximum time (seconds) for a single sandbox evaluation |
+
+</details>
+
+<details>
+<summary><strong>ProfilerConfig</strong> — logging and metrics parameters</summary>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `log_frequency` | `int` | `100` | Write detailed TensorBoard logs every N samples |
+| `complexity_group_size` | `int` | `5` | Width of complexity groups for TensorBoard scalars |
+
+</details>
+
+<details>
+<summary><strong>WorkerConfig</strong> — distributed worker timing</summary>
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `perf_report_interval_seconds` | `int` | `150` | How often workers report performance stats |
+| `monitor_interval_seconds` | `int` | `300` | How often the monitor prints a summary report |
+
+</details>
+
+---
+
+## 10. Problem Specification Format
+
+A problem is defined by a directory containing three files, plus a
+separate data directory with training CSV(s).
+
+### Directory Structure
+
+```
+specs/<problem_name>/
+├── prompt.txt      # Task description for the LLM (free-form text)
+├── equation.py     # Seed equation function (the starting point)
+└── evaluate.py     # Evaluation harness (scoring + optimization)
+
+data/<problem_name>/
+└── train.csv       # Training data (columns become dict keys)
+```
+
+### `prompt.txt`
+
+Free-form text describing the problem, background, inputs, constraints,
+and philosophy. This becomes the first section of every LLM prompt. It
+should be self-contained — the LLM receives no other context about the
+problem domain.
+
+### `equation.py` — Seed Equation
+
+Defines exactly **one** top-level function named `equation`. The
+signature must accept the data columns as positional arguments plus a
+`params` array:
 
 ```python
-# cli.py:214 — Fix dict access in main_single
-# Before (broken):
-eval_result = evaluators.analyse(
-    sample_info[0], prompt.island_id, ...
-)
-# After:
-eval_result = evaluators.analyse(
-    sample_info["response_text"], prompt.island_id, ...,
-    sample_token_usage=(sample_info["input_tokens"], sample_info["output_tokens"]),
-)
-
-# code_manipulation.py:194 — Fix ast.Str deprecation
-# Before:
-isinstance(node.body[0].value, ast.Str)
-# After:
-isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str)
+def equation(rho: jnp.ndarray, s: jnp.ndarray, params: jnp.ndarray) -> jnp.ndarray:
+    """Computes exchange-correlation energy density (e_xc)."""
+    # LDA exchange energy density: proportional to rho^(4/3)
+    e_x_lda = params[0] * rho**(4/3)
+    # ... enhancement factor, correlation, etc.
+    return e_x, e_c
 ```
 
-#### 1.2 Add Public Properties to Database/Island ✅
+Rules:
+- Exactly one `def` at the top level
+- The function body is the seed that gets evolved
+- Parameters are indexed from `params[0]`, `params[1]`, etc.
+- Must be parseable by `code_manipulation.text_to_function()`
 
-```python
-# database.py — Add properties
-class ProgramsDatabase:
-    @property
-    def sample_count(self) -> int:
-        return self._global_sample_nums
+### `evaluate.py` — Evaluation Harness
 
-    def finalize(self) -> None:
-        """Write final outputs and close resources."""
-        self._profiler.write_best_program_per_c_file()
+Must define an `evaluate(data: dict)` function. This function:
+- Receives `data_dict` (columns from `train.csv` as numpy arrays)
+- Calls `equation(...)` with the data and a parameter vector
+- Runs numerical optimization (e.g., BFGS + CMA-ES) to find optimal `params`
+- Returns `(score, optimized_params)` on success, or `None` on failure
 
-class Island:
-    @property
-    def num_clusters(self) -> int:
-        return len(self._clusters)
+The `equation` function referenced inside `evaluate.py` is **replaced at
+runtime** — the evaluator splices the evolved function body into the
+template before execution. The harness code (imports, data preprocessing,
+loss functions, optimizers) remains unchanged.
 
-    @property
-    def num_programs(self) -> int:
-        return self._num_programs
-```
-
-#### 1.3 Define Message Types ✅
-
-```python
-# messages.py
-@dataclasses.dataclass(frozen=True)
-class SampleMessage:
-    sample: str
-    island_id: int
-    version_generated: int
-    sample_time: float
-    sample_token_usage: tuple[int, int]
-
-@dataclasses.dataclass(frozen=True)
-class EvalResult:
-    function: ParsedFunction
-    island_id: int | None
-    result_per_test: dict | None
-    sample_time: float | None
-    evaluate_time: float | None
-    sample_token_usage: tuple[int, int] | None
-
-@dataclasses.dataclass(frozen=True)
-class PerfMessage:
-    worker_type: str
-    worker_id: int
-    stats: dict
-```
-
-#### 1.4 Use Custom Exceptions ✅
-
-```python
-# evaluator.py — replace generic exceptions
-from .exceptions import SandboxTimeoutError
-# In Sandbox.run():
-except mp.TimeoutError:
-    raise SandboxTimeoutError(f"Timed out after {timeout_seconds}s")
-
-# sampler.py
-from .exceptions import LLMProviderError
-# In _query_with_retry():
-raise LLMProviderError("All retries failed")
-```
-
-#### 1.5 Pass SamplerConfig Through CLI → Workers ✅
-
-```python
-# cli.py — Add sampler config CLI args
-parser.add_argument("--llm_provider", default="qwen")
-parser.add_argument("--llm_model", default=None)
-parser.add_argument("--llm_temperature", type=float, default=1.0)
-
-# workers.py — sampler_worker receives config
-def sampler_worker(..., sampler_config: SamplerConfig | None = None):
-    llm = sampler_mod.LLM(config=sampler_config)
-```
+> **Important markers.** The `evaluate.py` file must import the same
+> libraries used by `equation.py` (e.g., `jax.numpy as jnp`). The
+> evaluator concatenates `evaluate.py` + the evolved `equation` function
+> into a single script that is passed to `exec()`.
 
 ---
 
-### Phase 2: Separate Concerns in Function Dataclass ✅ COMPLETE
+## 11. Common Extension Points
 
-<!-- 第二阶段：拆分 Function 的职责，已完成 -->
+### 11.1 Adding an LLM Provider
 
-**Goal**: Split `Function` into `ParsedFunction` (immutable AST data) and `EvaluatedProgram` (runtime results).
+1. Create a new class inheriting from `LLMProvider` in `sampler.py`:
 
+   ```python
+   class MyProvider(LLMProvider):
+       def generate(self, prompt: str, config: SamplerConfig) -> LLMResponse:
+           # Call your API, return LLMResponse(response_text, input_tokens, output_tokens)
+           ...
+   ```
+
+2. Register it in the `_PROVIDERS` dict:
+
+   ```python
+   _PROVIDERS["myprovider"] = MyProvider
+   ```
+
+3. Set `provider: "myprovider"` in the YAML config.
+
+### 11.2 Adding a Problem
+
+1. Create a directory `specs/<problem_name>/` with:
+   - `prompt.txt` — problem description
+   - `equation.py` — seed function with the signature the evaluator expects
+   - `evaluate.py` — evaluation harness returning `(score, optimized_params)` or `None`
+
+2. Create a data directory with `train.csv`.
+
+3. Update the YAML config:
+
+   ```yaml
+   problem_dir: "specs/<problem_name>"
+   data_folder: "data/<problem_name>"
+   ```
+
+### 11.3 Checkpoint and Resume
+
+**Saving** is automatic when `save_ckpt_dir` is set (derived from
+`log_folder`). The database checks `maybe_checkpoint()` after every
+evaluation; if `save_ckpt_interval` seconds have elapsed, it pickles
+itself to `checkpoint_<N>.pkl`. A final `checkpoint_final.pkl` is saved
+on shutdown.
+
+**Resuming** from a checkpoint:
+
+```bash
+alpha-evolve-sr --config config.yaml --resume_from_ckpt ./log/<run>/checkpoints/
 ```
-Estimated effort: 2-3 days
-Risk: Medium — touches many modules, needs careful migration
-Status: ✅ COMPLETE
-```
 
-#### Result
-
-```mermaid
-graph LR
-    subgraph "Before"
-        F1["Function<br/>14 fields<br/>parsing + eval + runtime"]
-    end
-
-    subgraph "After (implemented)"
-        F2["ParsedFunction<br/>frozen=True<br/>name, args, body,<br/>return_type, docstring,<br/>decorators"]
-        F3["EvaluatedProgram<br/>parsed: ParsedFunction<br/>score, optimized_params,<br/>complexity, complexity_detail,<br/>global_sample_nums, sample_time,<br/>evaluate_time, token_usage,<br/>token_cost"]
-    end
-
-    F1 -.->|split into| F2
-    F1 -.->|split into| F3
-    F3 *-- F2
-```
-
-- `ParsedFunction` is a frozen dataclass with 6 fields (pure AST data)
-- `EvaluatedProgram` composes a `ParsedFunction` with evaluation and runtime metrics
-- `Program.functions` is now `list[ParsedFunction]`
-- `Cluster` stores `EvaluatedProgram` instances
-- `Function` remains as a backward-compatibility alias for `ParsedFunction`
+The system loads `checkpoint_final.pkl` for the database state and
+`run_config.yaml` for the configuration. The CLI re-applies any
+command-line overrides after loading.
 
 ---
 
-### Phase 2.5: EvolutionController ✅ COMPLETE
+## 12. Appendix: Import Dependency Matrix
 
-**Goal**: Extract duplicated orchestration logic from `main_single` and `database_worker` into a shared `EvolutionController`.
+<details>
+<summary>Click to expand the full dependency matrix</summary>
 
-```
-Status: ✅ COMPLETE — controller.py implements EvolutionController
-```
+Each `▶` indicates a direct import. `TYPE` indicates a `TYPE_CHECKING`-only import.
 
-The `EvolutionController` manages database lifecycle (init, register, checkpoint, finalize) and is used by both `cli.py` and `workers.py`, eliminating the ~70% code overlap.
+| Module ↓ imports → | config | code_manip | database | sampler | evaluator | complexity | profiler | checkpoint | logging | exceptions | messages |
+|--------------------|--------|-----------|----------|---------|-----------|-----------|----------|-----------|---------|-----------|----------|
+| **cli.py** | ▶ | ▶ | ▶ | ▶ | ▶ | | | ▶ | ▶ | | |
+| **workers.py** | ▶ | ▶ | ▶ | ▶ | ▶ | | | | ▶ | | ▶ |
+| **database.py** | ▶ | ▶ | | | | | ▶ | ▶ | ▶ | | ▶ |
+| **evaluator.py** | ▶ | ▶ | | | | ▶ | | | ▶ | | ▶ |
+| **sampler.py** | ▶ | | | | | | | | ▶ | ▶ | |
+| **profiler.py** | ▶ | ▶ | | | | | | | ▶ | | |
+| **complexity.py** | | | | | | | | | ▶ | | |
+| **checkpoint.py** | ▶ | | TYPE | | | | | | ▶ | ▶ | |
+| **messages.py** | | ▶ | | | | | | | | | |
+| **logging_config.py** | | | | | | | | | | | |
+| **exceptions.py** | | | | | | | | | | | |
 
----
-
-### Phase 3: Architectural Improvements
-
-<!-- 第三阶段：架构级改动，需要根据项目方向决定 -->
-
-**Goal**: Improve reliability, extensibility, and operational maturity.
-
-```
-Estimated effort: 3-5 days
-Risk: Higher — architectural changes, needs design decisions
-```
-
-#### 3.1 Cluster Pruning ✅ COMPLETE
-
-```python
-class Cluster:
-    def __init__(self, complexity_bin, implementation, max_size=100):
-        ...
-
-    def register_program(self, program):
-        self._programs.append(program)
-        self._scores.append(program.score)
-        if len(self._programs) > self._max_size:
-            self._prune()
-
-    def _prune(self):
-        """Remove lowest-scoring programs to stay within max_size."""
-        ...
-```
-
-Cluster max size is configurable via `ProgramsDatabaseConfig.cluster_max_size` (default 100).
-
-#### 3.2 Pareto-Aware Selection (Next Step)
-
-Currently, selection in `Cluster.sample_program()` ranks by score only; complexity is used only for binning. The next step is to implement Pareto-aware selection that considers both score and complexity when ranking candidates.
-
-#### 3.3 Checkpoint Format Migration
-
-```
-Option A: JSON + separate .py files (human-readable, version-resilient)
-Option B: SQLite (queryable, atomic writes)
-Option C: Keep pickle but add version header + migration support
-```
-
-#### 3.4 Prompt Template Extraction
-
-```python
-class PromptTemplate:
-    """Configurable prompt builder, separating content from construction logic."""
-    def __init__(self, task_description: str, rules: list[str]):
-        ...
-
-    def build(self, implementations: list[EvaluatedProgram], next_version: int) -> str:
-        ...
-```
-
-#### 3.5 Enhanced Sandbox (if needed for production)
-
-```
-- Use subprocess with resource limits (ulimit)
-- Network namespace isolation (Linux only)
-- Filesystem restrictions via tempdir + chroot
-- Memory limit via cgroups or resource module
-```
-
----
-
-### Refactoring Dependency Graph
-
-<!-- 重构阶段之间的依赖关系 -->
-
-```mermaid
-graph TD
-    P1_1["1.1 Fix P0 Bugs ✅"] --> P1_2["1.2 Add Public Properties ✅"]
-    P1_2 --> P1_3["1.3 Define Message Types ✅"]
-    P1_3 --> P1_4["1.4 Use Custom Exceptions ✅"]
-    P1_4 --> P1_5["1.5 Pass SamplerConfig ✅"]
-
-    P1_5 --> P2["2. Split Function Dataclass ✅"]
-    P2 --> P2_5["2.5 EvolutionController ✅"]
-    P2_5 --> P3_1["3.1 Cluster Pruning ✅"]
-    P2_5 --> P3_2["3.2 Pareto-Aware Selection"]
-    P2 --> P3_3["3.3 Checkpoint Format"]
-    P2 --> P3_4["3.4 Prompt Template"]
-    P1_1 --> P3_5["3.5 Enhanced Sandbox"]
-
-    style P1_1 fill:#4caf50,color:#fff
-    style P1_2 fill:#4caf50,color:#fff
-    style P1_3 fill:#4caf50,color:#fff
-    style P1_4 fill:#4caf50,color:#fff
-    style P1_5 fill:#4caf50,color:#fff
-    style P2 fill:#4caf50,color:#fff
-    style P2_5 fill:#4caf50,color:#fff
-    style P3_1 fill:#4caf50,color:#fff
-    style P3_2 fill:#87ceeb
-    style P3_3 fill:#98fb98
-    style P3_4 fill:#98fb98
-    style P3_5 fill:#98fb98
-```
-
-**Legend**: Green = completed, Blue = in progress, Light green = planned
-
----
-
-## Appendix: Module Dependency Matrix
-
-<!-- 模块间依赖矩阵，▶ 表示直接导入 -->
-
-| Module ↓ imports → | config | code_manip | database | sampler | evaluator | complexity | profiler | checkpoint | logging | exceptions | messages | controller |
-|--------------------|--------|-----------|----------|---------|-----------|-----------|----------|-----------|---------|-----------|----------|-----------|
-| **cli.py** | ▶ | ▶ | | ▶ | ▶ | | | ▶ | ▶ | ▶ | | ▶ |
-| **workers.py** | ▶ | ▶ | | ▶ | ▶ | | | | ▶ | | ▶ | ▶ |
-| **controller.py** | ▶ | ▶ | ▶ | | | | | ▶ | ▶ | | ▶ | |
-| **database.py** | ▶ | ▶ | | | | | ▶ | | ▶ | | | |
-| **evaluator.py** | ▶ | ▶ | | | | ▶ | | | ▶ | | ▶ | |
-| **sampler.py** | ▶ | | | | | | | | ▶ | ▶ | | |
-| **profiler.py** | ▶ | ▶ | | | | | | | ▶ | | | |
-| **complexity.py** | | | | | | | | | ▶ | | | |
-| **checkpoint.py** | | | TYPE_ONLY | | | | | | ▶ | ▶ | | |
-| **messages.py** | | ▶ | | | | | | | | | | |
-| **exceptions.py** | | | | | | | | | | | | |
+</details>

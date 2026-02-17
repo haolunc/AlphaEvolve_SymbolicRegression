@@ -1,0 +1,30 @@
+Develop a compact and physically interpretable model for the exchange correlation energy density in Density Functional Theory (DFT).
+
+Background:
+We have computed inverse DFT exchange correlation energy density data for three atoms (Helium, Neon, Oxygen)
+with the Jellium model. The goal is to discover the functional form of e_xc (exchange correlation energy density).
+
+Objective:
+Construct a mathematical expression for exchange correlation energy density e_xc as a function of:
+- ρ (rho): electron density
+- s: reduced density gradient, defined as s = |∇ρ| / (2(3π²)^(1/3) ρ^(4/3))
+
+The model should:
+1. Be physically interpretable and align with known DFT principles
+2. Include gradient corrections that capture semi-local and nonlocal effects
+3. Be compact enough to be computationally efficient
+
+Inputs:
+- rho (ρ): electron density at each grid point
+- s: reduced density gradient
+
+Constraints:
+- You may only use the following jax.numpy operations: (+), (-), (*), (/), (.**.), (·**2), (·**3), (jnp.log)
+- The model should not be too complex. **Use less than 15 parameters!**
+- Consider that the LDA exchange energy density is proportional to ρ^(4/3)
+
+Philosophy:
+- Start from known physics
+- Enhancement factors should be reasonable
+- Think about asymptotic limits: what happens when s → 0 (uniform density) or s → ∞ (rapidly varying density)?
+- Consider established functionals (PBE, B88, PW92 ...) as inspiration, but allow for novel forms

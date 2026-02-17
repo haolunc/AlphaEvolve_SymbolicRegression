@@ -18,7 +18,6 @@
 
 from __future__ import annotations
 
-import copy
 import dataclasses
 import multiprocessing as mp
 import time
@@ -30,7 +29,7 @@ from . import code_manipulation
 from .complexity import complexity_score
 from .config import EvaluatorConfig
 from .logging_config import get_logger
-from .messages import EvalResult
+from .messages import EvalResult, ExecutionResult, SampleMessage
 
 logger = get_logger("evaluator")
 
@@ -44,19 +43,17 @@ def _extract_python(text: str) -> str:
 
 def _sample_to_program(
     sample_body: str,
-    template: code_manipulation.Program,
-    function_to_evolve: str,
+    evaluate_code: str,
+    seed_function: code_manipulation.ParsedFunction,
 ) -> tuple[code_manipulation.ParsedFunction, str]:
     """Returns the equation replaced with LLM sample and the full runnable program."""
-    program = copy.deepcopy(template)
-    idx = program.find_function_index(function_to_evolve)
-    new_func = dataclasses.replace(program.functions[idx], body=sample_body)
-    program.functions[idx] = new_func
-    return new_func, str(program)
+    new_func = dataclasses.replace(seed_function, body=sample_body)
+    program = evaluate_code + "\n\n" + str(new_func)
+    return new_func, program
 
 
 def _execute_in_subprocess(
-    program: str, function_to_run: str, data_dict: dict, result_queue: mp.Queue | None = None
+    program: str, data_dict: dict, result_queue: mp.Queue | None = None
 ) -> tuple[Any, bool]:
     """Execute untrusted code in a subprocess and return the result."""
     try:
@@ -68,10 +65,10 @@ def _execute_in_subprocess(
         if "get_gradients" in namespace:
             namespace["get_gradients"] = jax.jit(namespace["get_gradients"])
 
-        if function_to_run not in namespace:
+        if "evaluate" not in namespace:
             return None, False
 
-        function = namespace[function_to_run]
+        function = namespace["evaluate"]
         result = function(data_dict)
 
         if result_queue is not None:
@@ -119,15 +116,14 @@ class Sandbox:
     def run(
         self,
         program: str,
-        function_to_run: str,
         data_dict: dict,
         timeout_seconds: int,
     ) -> tuple[Any, bool]:
-        """Execute *function_to_run* inside *program* with a timeout."""
+        """Execute the ``evaluate`` function inside *program* with a timeout."""
         try:
             pool = self._ensure_pool()
             async_result = pool.apply_async(
-                _execute_in_subprocess, args=(program, function_to_run, data_dict, None)
+                _execute_in_subprocess, args=(program, data_dict, None)
             )
             try:
                 result, success = async_result.get(timeout=timeout_seconds)
@@ -152,15 +148,13 @@ class Evaluator:
 
     def __init__(
         self,
-        template: code_manipulation.Program,
-        function_to_evolve: str,
-        function_to_run: str,
+        evaluate_code: str,
+        seed_function: code_manipulation.ParsedFunction,
         data_dict: dict,
         config: EvaluatorConfig | None = None,
     ):
-        self._template = template
-        self._function_to_evolve = function_to_evolve
-        self._function_to_run = function_to_run
+        self._evaluate_code = evaluate_code
+        self._seed_function = seed_function
         self._data_dict = data_dict
         self._config = config or EvaluatorConfig()
         self._sandbox = Sandbox()
@@ -169,39 +163,19 @@ class Evaluator:
         """Release sandbox resources."""
         self._sandbox.clean()
 
-    def analyse(
-        self,
-        sample: str,
-        island_id: int | None,
-        version_generated: int | None,
-        sample_time: float | None = None,
-        sample_token_usage: tuple[int, int] | None = None,
-        sample_token_cost: float | None = None,
-    ) -> EvalResult | None:
-        """Compile *sample* into a program and execute it.
-
-        Returns an ``EvalResult`` on success, or ``None`` on failure.
-        """
-        try:
-            if version_generated:
-                sample_function_body = code_manipulation.text_to_function(_extract_python(sample)).body
-            else:
-                sample_function_body = sample
-
-            new_function, program = _sample_to_program(
-                sample_function_body, self._template, self._function_to_evolve
-            )
-        except Exception as e:
-            logger.error("Error parsing sample: %s\n %s", e, sample)
-            return None
+    def _evaluate_body(self, sample_body: str) -> EvalResult | None:
+        """Build program from *sample_body*, execute in sandbox, return ``EvalResult``."""
+        new_function, program = _sample_to_program(
+            sample_body, self._evaluate_code, self._seed_function
+        )
 
         time_reset = time.time()
         run_result, runs_ok = self._sandbox.run(
-            program, self._function_to_run, self._data_dict, self._config.timeout_seconds
+            program, self._data_dict, self._config.timeout_seconds
         )
         evaluate_time = time.time() - time_reset
 
-        result_per_test: dict | None = None
+        execution_result: ExecutionResult | None = None
         if runs_ok and run_result is not None:
             try:
                 complexity_val, complexity_detail = complexity_score(str(new_function), return_breakdown=True)
@@ -210,22 +184,34 @@ class Evaluator:
                 complexity_val = None
                 complexity_detail = {}
 
-            score = run_result[0]
-            optimized_params = run_result[1]
-
-            result_per_test = {
-                "score": score,
-                "optimized_params": optimized_params,
-                "complexity": complexity_val,
-                "complexity_detail": complexity_detail,
-            }
+            execution_result = ExecutionResult(
+                score=run_result[0],
+                optimized_params=run_result[1],
+                complexity=complexity_val,
+                complexity_detail=complexity_detail,
+            )
 
         return EvalResult(
             function=new_function,
-            island_id=island_id,
-            result_per_test=result_per_test,
-            sample_time=sample_time,
+            execution_result=execution_result,
             evaluate_time=evaluate_time,
-            sample_token_usage=sample_token_usage,
-            sample_token_cost=sample_token_cost,
         )
+
+    def initialize(self) -> EvalResult | None:
+        """Evaluate the seed function. Returns ``EvalResult`` or ``None``."""
+        return self._evaluate_body(self._seed_function.body)
+
+    def analyse(self, sample_message: SampleMessage) -> EvalResult | None:
+        """Parse an LLM-generated sample and evaluate it.
+
+        Returns an ``EvalResult`` on success, or ``None`` on failure.
+        """
+        try:
+            sample_function_body = code_manipulation.text_to_function(
+                _extract_python(sample_message.llm_response.response_text)
+            ).body
+        except Exception as e:
+            logger.error("Error parsing sample: %s\n %s", e, sample_message.llm_response.response_text)
+            return None
+
+        return self._evaluate_body(sample_function_body)

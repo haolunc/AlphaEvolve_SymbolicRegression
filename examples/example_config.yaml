@@ -1,7 +1,7 @@
 # =====================================================================
 # Required — fill these in before running
 # =====================================================================
-spec_path:           # Path to specification file (e.g. specs/specification_example.txt)
+problem_dir:         # Path to problem directory (e.g. specs/dft_xc/)
 data_folder:         # Path to data folder containing train.csv
 log_folder:          # Name for this experiment's log directory
 
@@ -15,9 +15,8 @@ num_samplers: 8
 num_evaluators: 8
 
 # =====================================================================
-# Checkpointing
+# Checkpointing (saves are incremental via SQLite — no interval needed)
 # =====================================================================
-save_ckpt_interval: 300
 # save_ckpt_dir:     # Auto-derived from log_folder if omitted
 # resume_from_ckpt:  # Set to checkpoint dir path to resume
 

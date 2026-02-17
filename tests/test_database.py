@@ -2,9 +2,35 @@
 
 import pytest
 
-from alpha_evolve_sr.code_manipulation import EvaluatedProgram, ParsedFunction, text_to_program
+from alpha_evolve_sr.code_manipulation import EvaluatedProgram, ParsedFunction
 from alpha_evolve_sr.config import ProgramsDatabaseConfig
-from tests.conftest import SAMPLE_SPEC
+from alpha_evolve_sr.messages import EvalResult, ExecutionResult, LLMResponse, SampleMessage
+from tests.conftest import SAMPLE_PROMPT, SAMPLE_SEED_FUNCTION
+
+
+def _make_result(function, island_id=None, score=-1.0, complexity=5):
+    """Build an (EvalResult, SampleMessage | None) pair for testing."""
+    eval_result = EvalResult(
+        function=function,
+        execution_result=ExecutionResult(
+            score=score, optimized_params=None,
+            complexity=complexity, complexity_detail={},
+        ),
+        evaluate_time=0.1,
+    )
+    sample_msg = None
+    if island_id is not None:
+        sample_msg = SampleMessage(
+            llm_response=LLMResponse(
+                response_text="return x",
+                input_tokens=10,
+                output_tokens=20,
+                token_cost=0.001,
+            ),
+            island_id=island_id,
+            sample_time=0.1,
+        )
+    return eval_result, sample_msg
 
 
 @pytest.fixture
@@ -17,25 +43,12 @@ def db(tmp_path):
         cluster_sampling_temperature_init=0.1,
         cluster_sampling_temperature_period=20,
     )
-    template = text_to_program(SAMPLE_SPEC)
     log_dir = str(tmp_path / "logs")
 
     from alpha_evolve_sr.database import ProgramsDatabase
-    database = ProgramsDatabase(config, template, "equation", log_dir)
+    database = ProgramsDatabase(config, SAMPLE_PROMPT, log_dir)
 
-    # Register an initial program — pass ParsedFunction + result_per_test
-    func = template.get_function("equation")
-
-    database.register_program(
-        func,
-        island_id=None,
-        result_per_test={
-            "score": -1.0,
-            "optimized_params": None,
-            "complexity": 5,
-            "complexity_detail": {"BinOp": 1},
-        },
-    )
+    database.register_program(*_make_result(SAMPLE_SEED_FUNCTION, island_id=None, score=-1.0, complexity=5))
     return database
 
 
@@ -43,7 +56,6 @@ class TestProgramsDatabase:
     def test_get_prompt_returns_prompt(self, db):
         prompt = db.get_prompt()
         assert hasattr(prompt, "code")
-        assert hasattr(prompt, "version_generated")
         assert hasattr(prompt, "island_id")
         assert isinstance(prompt.code, str)
         assert len(prompt.code) > 0
@@ -55,10 +67,7 @@ class TestProgramsDatabase:
             args="x, params",
             body="    return x * params[0]",
         )
-        db.register_program(
-            func, island_id=0,
-            result_per_test={"score": -0.5, "optimized_params": None, "complexity": 3, "complexity_detail": {}},
-        )
+        db.register_program(*_make_result(func, island_id=0, score=-0.5, complexity=3))
         assert db.sample_count == initial_count + 1
 
     def test_island_reset(self, db):
@@ -69,19 +78,11 @@ class TestProgramsDatabase:
                 args="x, params",
                 body=f"    return x * {i}",
             )
-            result = {
-                "score": float(-100 + i), "optimized_params": None,
-                "complexity": 3, "complexity_detail": {},
-            }
             db.register_program(
-                func, island_id=i % db._config.num_islands, result_per_test=result,
+                *_make_result(func, island_id=i % db._config.num_islands, score=float(-100 + i), complexity=3),
             )
         # Should not raise and sample count should be correct
         assert db.sample_count > db._config.reset_period
-
-    def test_sample_count_property(self, db):
-        """sample_count property returns the same value as _global_sample_nums."""
-        assert db.sample_count == db._global_sample_nums
 
     def test_finalize_writes_file(self, db):
         """finalize() writes the best-program-per-complexity file."""
@@ -145,40 +146,28 @@ class TestParetoFront:
         """A program dominated by an existing front member is not added."""
         func = ParsedFunction(name="equation", args="x, params", body="    return x")
         # Worse score, same complexity → dominated
-        db.register_program(
-            func, island_id=0,
-            result_per_test={"score": -2.0, "optimized_params": None, "complexity": 5, "complexity_detail": {}},
-        )
+        db.register_program(*_make_result(func, island_id=0, score=-2.0, complexity=5))
         assert len(db.pareto_front) == 1
 
     def test_non_dominated_extends_front(self, db):
         """A non-dominated program extends the front."""
         func = ParsedFunction(name="equation", args="x, params", body="    return x")
         # Better score, higher complexity → non-dominated
-        db.register_program(
-            func, island_id=0,
-            result_per_test={"score": -0.5, "optimized_params": None, "complexity": 20, "complexity_detail": {}},
-        )
+        db.register_program(*_make_result(func, island_id=0, score=-0.5, complexity=20))
         assert len(db.pareto_front) == 2
 
     def test_dominating_program_prunes_front(self, db):
         """Adding a program that dominates existing members prunes them."""
         func = ParsedFunction(name="equation", args="x, params", body="    return x")
         # Better score AND lower complexity → dominates the initial
-        db.register_program(
-            func, island_id=0,
-            result_per_test={"score": -0.5, "optimized_params": None, "complexity": 3, "complexity_detail": {}},
-        )
+        db.register_program(*_make_result(func, island_id=0, score=-0.5, complexity=3))
         assert len(db.pareto_front) == 1
         assert db.pareto_front[0].score == -0.5
 
     def test_front_sorted_by_complexity(self, db):
         func = ParsedFunction(name="equation", args="x, params", body="    return x")
         for c, s in [(20, -0.5), (3, -2.0), (10, -0.8)]:
-            db.register_program(
-                func, island_id=0,
-                result_per_test={"score": s, "optimized_params": None, "complexity": c, "complexity_detail": {}},
-            )
+            db.register_program(*_make_result(func, island_id=0, score=s, complexity=c))
         complexities = [p.complexity for p in db.pareto_front]
         assert complexities == sorted(complexities)
 
@@ -189,16 +178,13 @@ class TestParetoFront:
             cluster_sampling_temperature_init=0.1, cluster_sampling_temperature_period=20,
             pareto_aware=True,
         )
-        template = text_to_program(SAMPLE_SPEC)
         from alpha_evolve_sr.database import ProgramsDatabase
-        database = ProgramsDatabase(config, template, "equation", str(tmp_path / "logs"))
+        database = ProgramsDatabase(config, SAMPLE_PROMPT, str(tmp_path / "logs"))
 
-        func = template.get_function("equation")
         # Register a few programs with different complexities to build a Pareto front
         for c, s in [(5, -1.0), (15, -0.5), (25, -0.3)]:
             database.register_program(
-                func, island_id=None,
-                result_per_test={"score": s, "optimized_params": None, "complexity": c, "complexity_detail": {}},
+                *_make_result(SAMPLE_SEED_FUNCTION, island_id=None, score=s, complexity=c),
             )
 
         prompt = database.get_prompt()

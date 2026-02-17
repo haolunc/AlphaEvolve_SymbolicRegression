@@ -73,7 +73,6 @@ class ParsedFunction:
     body: str
     return_type: str | None = None
     docstring: str | None = None
-    decorators: list[str] | None = None
 
     def __post_init__(self) -> None:
         # Sanitize body: strip leading/trailing newlines.
@@ -107,9 +106,6 @@ class ParsedFunction:
                     file.write("\n")
             file.write(function_source)
 
-
-# Temporary backward-compatibility alias.
-Function = ParsedFunction
 
 
 # ---------------------------------------------------------------------------

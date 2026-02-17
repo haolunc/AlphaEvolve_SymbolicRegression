@@ -12,7 +12,7 @@ from . import code_manipulation
 from . import evaluator as evaluator_mod
 from . import sampler as sampler_mod
 from .config import EvaluatorConfig, RunConfig, SamplerConfig, WorkerConfig
-from .controller import EvolutionController
+from .database import ProgramsDatabase
 from .logging_config import get_logger, setup_file_logger
 from .messages import PerfMessage, SampleMessage
 
@@ -33,14 +33,28 @@ def _close_queues(queues: list[Queue], worker_logger: logging.Logger) -> None:
             worker_logger.debug("Error closing queue", exc_info=True)
 
 
+def _maybe_report_perf(
+    start_time: float,
+    interval: int,
+    perf_queue: Queue,
+    worker_type: str,
+    worker_id: int,
+    stats: dict,
+) -> float:
+    """Send a PerfMessage if *interval* seconds have elapsed. Returns updated start_time."""
+    if time.time() - start_time > interval:
+        perf_queue.put(PerfMessage(worker_type=worker_type, worker_id=worker_id, stats=stats))
+        return time.time()
+    return start_time
+
+
 # ---------------------------------------------------------------------------
 # Database worker
 # ---------------------------------------------------------------------------
 
 def database_worker(
     run_config: RunConfig,
-    template: code_manipulation.Program,
-    function_to_evolve: str,
+    prompt_text: str,
     prompt_queue: Queue,
     prompt_pending_count: Value,
     result_queue: Queue,
@@ -53,13 +67,6 @@ def database_worker(
     wlog = get_logger("database_worker")
     wlog.info("Database worker started (PID: %d)", os.getpid())
 
-    controller = EvolutionController(
-        run_config.database, template, function_to_evolve, run_config.log_path,
-        ckpt_dir=run_config.save_ckpt_dir, ckpt_interval=run_config.save_ckpt_interval,
-        max_samples=run_config.max_samples,
-        profiler_config=run_config.profiler,
-    )
-
     # Initialize: resume from checkpoint or wait for initial eval
     initial_result = None
     if not run_config.resume_from_ckpt:
@@ -67,7 +74,11 @@ def database_worker(
         initial_result = initial_result_queue.get()
         wlog.info("Initial program registered")
 
-    controller.initialize(
+    database = ProgramsDatabase.restore_or_create(
+        run_config.database, prompt_text, run_config.log_path,
+        profiler_config=run_config.profiler,
+        ckpt_dir=run_config.save_ckpt_dir,
+        max_samples=run_config.max_samples,
         resume_path=run_config.resume_from_ckpt, initial_result=initial_result,
     )
 
@@ -80,7 +91,7 @@ def database_worker(
         while not termination_event.is_set():
             # Fill prompt queue
             while prompt_pending_count.value < run_config.num_samplers and not termination_event.is_set():
-                prompt = controller.get_prompt()
+                prompt = database.get_prompt()
                 if not show_prompt:
                     logger.debug("First prompt:\n%s", prompt.code)
                     show_prompt = True
@@ -91,11 +102,11 @@ def database_worker(
 
             # Process results
             try:
-                eval_result = result_queue.get(timeout=0.1)
-                controller.register_eval_result(eval_result)
+                eval_result, sample_msg = result_queue.get(timeout=0.1)
+                database.register_program(eval_result, sample_msg)
                 results_processed += 1
 
-                if controller.should_stop:
+                if database.should_stop:
                     wlog.info("Reached max samples (%d), setting termination event", run_config.max_samples)
                     termination_event.set()
             except mp.queues.Empty:
@@ -103,25 +114,21 @@ def database_worker(
             except Exception as e:
                 wlog.error("Database worker error: %s", e)
 
-            controller.maybe_checkpoint()
+            database.maybe_checkpoint()
 
             # Periodic performance report
-            if time.time() - start_time > wc.perf_report_interval_seconds:
-                wlog.info("prompt_pending: %d", prompt_pending_count.value)
-                perf_queue.put(PerfMessage(
-                    worker_type="database",
-                    worker_id=0,
-                    stats={
-                        "prompts_generated": prompts_generated,
-                        "results_processed": results_processed,
-                        "global_sample_nums": controller.sample_count,
-                    },
-                ))
-                start_time = time.time()
+            start_time = _maybe_report_perf(
+                start_time, wc.perf_report_interval_seconds, perf_queue,
+                "database", 0, {
+                    "prompts_generated": prompts_generated,
+                    "results_processed": results_processed,
+                    "global_sample_nums": database.sample_count,
+                },
+            )
     except KeyboardInterrupt:
         wlog.info("KeyboardInterrupt received, shutting down database worker")
     finally:
-        controller.finalize()
+        database.finalize()
         wlog.info("Database worker shutting down")
         _close_queues([prompt_queue, result_queue, initial_result_queue, perf_queue], wlog)
 
@@ -181,12 +188,9 @@ def sampler_worker(
                 for sample_info in all_samples_info:
                     if sample_info:
                         sample_queue.put(SampleMessage(
-                            sample=sample_info.response_text,
+                            llm_response=sample_info,
                             island_id=prompt.island_id,
-                            version_generated=prompt.version_generated,
                             sample_time=sample_time,
-                            sample_token_usage=(sample_info.input_tokens, sample_info.output_tokens),
-                            sample_token_cost=sample_info.token_cost,
                         ))
                         samples_generated += 1
                         with sample_pending_count.get_lock():
@@ -194,16 +198,13 @@ def sampler_worker(
 
                 prompts_processed += 1
 
-                if time.time() - start_time > wc.perf_report_interval_seconds:
-                    perf_queue.put(PerfMessage(
-                        worker_type="sampler",
-                        worker_id=worker_id,
-                        stats={
-                            "prompts_processed": prompts_processed,
-                            "samples_generated": samples_generated,
-                        },
-                    ))
-                    start_time = time.time()
+                start_time = _maybe_report_perf(
+                    start_time, wc.perf_report_interval_seconds, perf_queue,
+                    "sampler", worker_id, {
+                        "prompts_processed": prompts_processed,
+                        "samples_generated": samples_generated,
+                    },
+                )
             except mp.queues.Empty:
                 pass
             except Exception as e:
@@ -224,9 +225,8 @@ def sampler_worker(
 
 def evaluator_worker(
     worker_id: int,
-    template: code_manipulation.Program,
-    function_to_evolve: str,
-    function_to_run: str,
+    evaluate_code: str,
+    seed_function: code_manipulation.ParsedFunction,
     data_dict: dict,
     sample_queue: Queue,
     sample_pending_count: Value,
@@ -244,14 +244,13 @@ def evaluator_worker(
     wlog.info("Evaluator worker %d started (PID: %d)", worker_id, os.getpid())
 
     eval_instance = evaluator_mod.Evaluator(
-        template, function_to_evolve, function_to_run, data_dict,
+        evaluate_code, seed_function, data_dict,
         config=evaluator_config,
     )
 
     if process_initial:
         wlog.info("Processing initial program")
-        initial = template.get_function(function_to_evolve).body
-        eval_result = eval_instance.analyse(initial, island_id=None, version_generated=None)
+        eval_result = eval_instance.initialize()
         initial_result_queue.put(eval_result)
         wlog.info("Initial program evaluation complete")
 
@@ -267,33 +266,23 @@ def evaluator_worker(
                 with sample_pending_count.get_lock():
                     sample_pending_count.value -= 1
 
-                eval_result = eval_instance.analyse(
-                    sample_msg.sample,
-                    sample_msg.island_id,
-                    sample_msg.version_generated,
-                    sample_msg.sample_time,
-                    sample_msg.sample_token_usage,
-                    sample_msg.sample_token_cost,
-                )
+                eval_result = eval_instance.analyse(sample_msg)
                 if eval_result is not None:
-                    result_queue.put(eval_result)
+                    result_queue.put((eval_result, sample_msg))
                     successful_evaluations += 1
                 else:
                     failed_evaluations += 1
 
                 samples_processed += 1
 
-                if time.time() - start_time > wc.perf_report_interval_seconds:
-                    perf_queue.put(PerfMessage(
-                        worker_type="evaluator",
-                        worker_id=worker_id,
-                        stats={
-                            "samples_processed": samples_processed,
-                            "successful_evaluations": successful_evaluations,
-                            "failed_evaluations": failed_evaluations,
-                        },
-                    ))
-                    start_time = time.time()
+                start_time = _maybe_report_perf(
+                    start_time, wc.perf_report_interval_seconds, perf_queue,
+                    "evaluator", worker_id, {
+                        "samples_processed": samples_processed,
+                        "successful_evaluations": successful_evaluations,
+                        "failed_evaluations": failed_evaluations,
+                    },
+                )
             except mp.queues.Empty:
                 pass
     except KeyboardInterrupt:

@@ -13,10 +13,10 @@ from . import checkpoint, code_manipulation
 from . import evaluator as evaluator_mod
 from . import sampler as sampler_mod
 from .config import RunConfig
-from .controller import EvolutionController
-from .exceptions import SpecificationError
+from .database import ProgramsDatabase
 from .logging_config import configure_logging, get_logger
-from .workers import database_worker, evaluator_worker, monitoring_worker, sampler_worker
+from .messages import SampleMessage
+from .workers import _close_queues, database_worker, evaluator_worker, monitoring_worker, sampler_worker
 
 logger = get_logger("cli")
 
@@ -25,26 +25,30 @@ logger = get_logger("cli")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _extract_function_names(specification: str) -> tuple[str, str]:
-    """Returns the name of the function to evolve and of the function to run."""
-    run_functions = list(code_manipulation.yield_decorated(specification, "evaluate", "run"))
-    if len(run_functions) != 1:
-        raise SpecificationError("Expected 1 function decorated with `# @evaluate.run`.")
-    evolve_functions = list(code_manipulation.yield_decorated(specification, "equation", "evolve"))
-    if len(evolve_functions) != 1:
-        raise SpecificationError("Expected 1 function decorated with `# @equation.evolve`.")
-    return evolve_functions[0], run_functions[0]
+def load_problem(
+    problem_dir: str,
+    data_folder: str,
+) -> tuple[str, str, code_manipulation.ParsedFunction, dict]:
+    """Load a problem directory and training data.
 
+    Returns:
+        prompt_text, evaluate_code, seed_function, data_dict
+    """
+    with open(os.path.join(problem_dir, "prompt.txt"), encoding="utf-8") as f:
+        prompt_text = f.read()
 
-def load_data(spec_path: str, data_folder: str) -> tuple[str, dict]:
-    """Loads specification and training data."""
-    with open(spec_path, encoding="utf-8") as f:
-        spec = f.read()
+    with open(os.path.join(problem_dir, "evaluate.py"), encoding="utf-8") as f:
+        evaluate_code = f.read()
+
+    with open(os.path.join(problem_dir, "equation.py"), encoding="utf-8") as f:
+        equation_code = f.read()
+
+    seed_function = code_manipulation.text_to_function(equation_code)
 
     df = pd.read_csv(os.path.join(data_folder, "train.csv"))
     data_dict = {col: df[col].values for col in df.columns}
 
-    return spec, data_dict
+    return prompt_text, evaluate_code, seed_function, data_dict
 
 
 # ---------------------------------------------------------------------------
@@ -53,13 +57,12 @@ def load_data(spec_path: str, data_folder: str) -> tuple[str, dict]:
 
 def main_distributed(
     run_config: RunConfig,
-    specification: str,
+    prompt_text: str,
+    evaluate_code: str,
+    seed_function: code_manipulation.ParsedFunction,
     data_dict: dict,
 ) -> None:
     """Launches a distributed pipeline experiment."""
-    function_to_evolve, function_to_run = _extract_function_names(specification)
-    template = code_manipulation.text_to_program(specification)
-
     prompt_queue = mp.Queue()
     prompt_pending_count = mp.Value("i", 0)
     sample_pending_count = mp.Value("i", 0)
@@ -84,7 +87,7 @@ def main_distributed(
         p = mp.Process(
             target=evaluator_worker,
             args=(
-                i, template, function_to_evolve, function_to_run, data_dict,
+                i, evaluate_code, seed_function, data_dict,
                 sample_queue, sample_pending_count, result_queue, initial_result_queue,
                 termination_event, perf_queue, i == 0 and process_initial,
             ),
@@ -100,7 +103,7 @@ def main_distributed(
     db_process = mp.Process(
         target=database_worker,
         args=(
-            run_config, template, function_to_evolve,
+            run_config, prompt_text,
             prompt_queue, prompt_pending_count, result_queue, initial_result_queue,
             termination_event, perf_queue,
         ),
@@ -126,12 +129,7 @@ def main_distributed(
         while not termination_event.is_set():
             time.sleep(5)
 
-        for q in (prompt_queue, sample_queue, result_queue, initial_result_queue, perf_queue):
-            try:
-                q.close()
-                q.join_thread()
-            except Exception:
-                logger.debug("Error closing queue", exc_info=True)
+        _close_queues([prompt_queue, sample_queue, result_queue, initial_result_queue, perf_queue], logger)
 
         for p in processes:
             p.join(10)
@@ -155,31 +153,26 @@ def main_distributed(
 
 def main_single(
     run_config: RunConfig,
-    specification: str,
+    prompt_text: str,
+    evaluate_code: str,
+    seed_function: code_manipulation.ParsedFunction,
     input_data: dict,
 ) -> None:
     """Launches a single-process experiment."""
-    function_to_evolve, function_to_run = _extract_function_names(specification)
-    template = code_manipulation.text_to_program(specification)
-
     evaluators = evaluator_mod.Evaluator(
-        template, function_to_evolve, function_to_run, input_data,
+        evaluate_code, seed_function, input_data,
         config=run_config.evaluator,
-    )
-
-    controller = EvolutionController(
-        run_config.database, template, function_to_evolve, run_config.log_path,
-        ckpt_dir=run_config.save_ckpt_dir, ckpt_interval=run_config.save_ckpt_interval,
-        max_samples=run_config.max_samples,
-        profiler_config=run_config.profiler,
     )
 
     initial_result = None
     if not run_config.resume_from_ckpt:
-        initial_body = template.get_function(function_to_evolve).body
-        initial_result = evaluators.analyse(initial_body, island_id=None, version_generated=None)
+        initial_result = evaluators.initialize()
 
-    controller.initialize(
+    database = ProgramsDatabase.restore_or_create(
+        run_config.database, prompt_text, run_config.log_path,
+        profiler_config=run_config.profiler,
+        ckpt_dir=run_config.save_ckpt_dir,
+        max_samples=run_config.max_samples,
         resume_path=run_config.resume_from_ckpt, initial_result=initial_result,
     )
 
@@ -187,7 +180,7 @@ def main_single(
 
     try:
         while True:
-            prompt = controller.get_prompt()
+            prompt = database.get_prompt()
             reset_time = time.time()
             all_samples_info = llm.draw_samples(prompt.code)
             sample_time = (time.time() - reset_time) / run_config.sampler.samples_per_prompt
@@ -195,27 +188,25 @@ def main_single(
             for sample_info in all_samples_info:
                 if not sample_info:
                     continue
+                sample_msg = SampleMessage(
+                    llm_response=sample_info,
+                    island_id=prompt.island_id,
+                    sample_time=sample_time,
+                )
                 try:
-                    eval_result = evaluators.analyse(
-                        sample_info.response_text,
-                        prompt.island_id,
-                        prompt.version_generated,
-                        sample_time,
-                        (sample_info.input_tokens, sample_info.output_tokens),
-                        sample_info.token_cost,
-                    )
+                    eval_result = evaluators.analyse(sample_msg)
                     if eval_result is not None:
-                        controller.register_eval_result(eval_result)
+                        database.register_program(eval_result, sample_msg)
                     else:
                         logger.warning("Error analysing sample: %s", sample_info.response_text)
                 except Exception:
                     logger.warning("Error analysing sample: %s", getattr(sample_info, "response_text", "unknown"))
 
-            controller.maybe_checkpoint()
-            if controller.should_stop:
+            database.maybe_checkpoint()
+            if database.should_stop:
                 break
     finally:
-        controller.finalize()
+        database.finalize()
         logger.info("Best program per complexity file written")
 
 
@@ -262,11 +253,17 @@ def main() -> None:
 
     mp.set_start_method("spawn")
 
-    spec, data_dict = load_data(run_config.spec_path, run_config.data_folder)
+    prompt_text, evaluate_code, seed_function, data_dict = load_problem(
+        run_config.problem_dir, run_config.data_folder,
+    )
 
     if run_config.distributed:
         logger.info("Running in distributed mode")
-        main_distributed(run_config, spec, data_dict)
+        main_distributed(
+            run_config, prompt_text, evaluate_code, seed_function, data_dict,
+        )
     else:
         logger.info("Running in non-distributed mode")
-        main_single(run_config, spec, data_dict)
+        main_single(
+            run_config, prompt_text, evaluate_code, seed_function, data_dict,
+        )
