@@ -63,33 +63,14 @@ tests/
 ## Quick Start
 
 ```bash
-# Basic run (distributed mode)
-alpha-evolve-sr \
-  --spec_path <spec_path> \
-  --data_folder <data_path> \
-  --log_folder <log_path> \
-  --max_samples 2000 \
-  --num_evaluators 4 \
-  --num_samplers 2
-
-# Non-distributed mode
-alpha-evolve-sr \
-  --spec_path <spec_path> \
-  --data_folder <data_path> \
-  --log_folder <log_path> \
-  --no-distributed \
-  --max_samples 2000
+# Run with config file (see example_config.yaml for all options)
+alpha-evolve-sr --config example_config.yaml
 
 # Resume from checkpoint
-alpha-evolve-sr \
-  --resume_from_ckpt <log_path>/checkpoints \
-  --max_samples 2000
+alpha-evolve-sr --config example_config.yaml --resume_from_ckpt <log_path>/checkpoints
 
 # Monitor with TensorBoard
 tensorboard --logdir <log_path> --port 6006
-
-# Run the DFT example
-python examples/run_dft_example.py --max_samples 10
 ```
 
 ---
