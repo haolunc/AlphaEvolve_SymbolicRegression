@@ -29,7 +29,7 @@ from . import code_manipulation, profiler
 from . import config as config_lib
 from .checkpoint import CheckpointDB
 from .logging_config import get_logger
-from .messages import EvalResult, SampleMessage
+from .messages import EvalResult, Prompt, SampleMessage
 
 logger = get_logger("database")
 
@@ -61,20 +61,6 @@ def _softmax(logits: np.ndarray, temperature: float) -> np.ndarray:
     index = np.argmax(result)
     result[index] = 1 - np.sum(result[0:index]) - np.sum(result[index + 1:])
     return result
-
-
-@dataclasses.dataclass(frozen=True)
-class Prompt:
-    """A prompt produced by the ProgramsDatabase, to be sent to Samplers.
-
-    Attributes:
-      code: The prompt, ending with the header of the function to be completed.
-      island_id: Identifier of the island that produced the implementations
-         included in the prompt.
-    """
-
-    code: str
-    island_id: int
 
 
 class ProgramsDatabase:

@@ -18,6 +18,20 @@ class LLMResponse:
 
 
 @dataclasses.dataclass(frozen=True)
+class Prompt:
+    """A prompt produced by the ProgramsDatabase, to be sent to Samplers.
+
+    Attributes:
+      code: The prompt, ending with the header of the function to be completed.
+      island_id: Identifier of the island that produced the implementations
+         included in the prompt.
+    """
+
+    code: str
+    island_id: int
+
+
+@dataclasses.dataclass(frozen=True)
 class SampleMessage:
     """Produced by sampler_worker, consumed by evaluator_worker."""
 
