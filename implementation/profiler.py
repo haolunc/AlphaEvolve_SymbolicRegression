@@ -77,7 +77,6 @@ class Profiler:
         )
 
         if self._num_samples % self._log_frequency == 0:
-            # ② 分复杂度曲线：一根曲线一个 complexity
             # scalars = {f"C={c}": s for c, s in self._best_score_per_c.items()}
             # self._writer.add_scalars("Best Score / Complexity", scalars, global_step=self._num_samples)
             

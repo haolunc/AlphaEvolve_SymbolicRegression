@@ -171,8 +171,8 @@ def main_distributed(arguments, config: ProgramsDatabaseConfig, specification: s
         for q in (prompt_queue, sample_queue, result_queue,
                 initial_result_queue, perf_queue):
             try:
-                q.close()           # 关闭管道
-                q.join_thread()     # 等待 FeederThread 退出
+                q.close()           # close queue
+                q.join_thread()     # wait for FeederThread exiting
             except:
                 pass
 

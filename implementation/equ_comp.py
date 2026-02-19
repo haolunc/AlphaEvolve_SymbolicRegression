@@ -19,24 +19,24 @@ OP_WEIGHTS = {
 
 
 FUNC_WEIGHTS = {
-    # 指数 / 对数
+    # Exponential / Logarithmic
     "exp": 1,
     "log": 1,
 
-    # 根号
+    # Square root
     "sqrt": 1,
 
-    # 三角函数
+    # Trigonometric functions
     "sin": 1,
     "cos": 1,
     "tan": 1,
 
-    # 双曲函数
+    # Hyperbolic functions
     "sinh": 1,
     "cosh": 1,
     "tanh": 1,
 
-    # 绝对值
+    # Absolute value
     "abs": 1,
 }
 
@@ -56,7 +56,7 @@ class ComplexityVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_Name(self, node: ast.Name):
-        """计数所有"被读取"的变量名"""
+        """count variable names"""
         if isinstance(node.ctx, ast.Load) and node.id in self.arg_names:
             self._add('Var', 1)
         self.generic_visit(node)
