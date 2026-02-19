@@ -4,6 +4,7 @@ import pytest
 
 from alpha_evolve_sr.code_manipulation import EvaluatedProgram, ParsedFunction
 from alpha_evolve_sr.config import ProgramsDatabaseConfig
+from alpha_evolve_sr.database import Island
 from alpha_evolve_sr.messages import EvalResult, ExecutionResult, LLMResponse, SampleMessage
 from tests.conftest import SAMPLE_PROMPT, SAMPLE_SEED_FUNCTION
 
@@ -93,46 +94,28 @@ class TestProgramsDatabase:
 
 
 class TestClusterPruning:
-    """Tests for Cluster max-size pruning."""
+    """Tests for Island bin max-size pruning."""
 
-    def test_cluster_respects_max_size(self):
+    def test_bin_respects_max_size(self):
         """Adding more programs than max_size triggers pruning."""
-        from alpha_evolve_sr.database import Cluster
+        island = Island(functions_per_prompt=2, complexity_bin_size=10, cluster_max_size=5)
 
-        parsed = ParsedFunction(
-            name="equation", args="x, params", body="    return x",
-        )
-        initial = EvaluatedProgram(parsed=parsed, score=0.0, complexity=5)
-        cluster = Cluster(complexity_bin=0, implementation=initial, max_size=5)
+        for i in range(10):
+            island.register(gsn=i, score=float(i), complexity=5)
 
-        for i in range(1, 10):
-            p = ParsedFunction(
-                name="equation", args="x, params", body=f"    return x * {i}",
-            )
-            ep = EvaluatedProgram(parsed=p, score=float(i), complexity=5)
-            cluster.register_program(ep)
-
-        assert len(cluster._programs) <= 5
+        assert island.num_programs <= 5
 
     def test_pruning_keeps_highest_scores(self):
         """Pruning should discard the lowest-scoring programs."""
-        from alpha_evolve_sr.database import Cluster
+        island = Island(functions_per_prompt=2, complexity_bin_size=10, cluster_max_size=5)
 
-        parsed = ParsedFunction(
-            name="equation", args="x, params", body="    return x",
-        )
-        initial = EvaluatedProgram(parsed=parsed, score=0.0, complexity=5)
-        cluster = Cluster(complexity_bin=0, implementation=initial, max_size=5)
-
-        for i in range(1, 10):
-            p = ParsedFunction(
-                name="equation", args="x, params", body=f"    return x * {i}",
-            )
-            ep = EvaluatedProgram(parsed=p, score=float(i), complexity=5)
-            cluster.register_program(ep)
+        for i in range(10):
+            island.register(gsn=i, score=float(i), complexity=5)
 
         # The 5 highest scores should be 5.0, 6.0, 7.0, 8.0, 9.0
-        assert sorted(cluster._scores) == [5.0, 6.0, 7.0, 8.0, 9.0]
+        cbin = 5 // 10  # = 0
+        scores = sorted(s for _, s in island._bins[cbin])
+        assert scores == [5.0, 6.0, 7.0, 8.0, 9.0]
 
 
 class TestParetoFront:
@@ -145,21 +128,21 @@ class TestParetoFront:
     def test_dominated_program_not_added(self, db):
         """A program dominated by an existing front member is not added."""
         func = ParsedFunction(name="equation", args="x, params", body="    return x")
-        # Worse score, same complexity → dominated
+        # Worse score, same complexity -> dominated
         db.register_program(*_make_result(func, island_id=0, score=-2.0, complexity=5))
         assert len(db.pareto_front) == 1
 
     def test_non_dominated_extends_front(self, db):
         """A non-dominated program extends the front."""
         func = ParsedFunction(name="equation", args="x, params", body="    return x")
-        # Better score, higher complexity → non-dominated
+        # Better score, higher complexity -> non-dominated
         db.register_program(*_make_result(func, island_id=0, score=-0.5, complexity=20))
         assert len(db.pareto_front) == 2
 
     def test_dominating_program_prunes_front(self, db):
         """Adding a program that dominates existing members prunes them."""
         func = ParsedFunction(name="equation", args="x, params", body="    return x")
-        # Better score AND lower complexity → dominates the initial
+        # Better score AND lower complexity -> dominates the initial
         db.register_program(*_make_result(func, island_id=0, score=-0.5, complexity=3))
         assert len(db.pareto_front) == 1
         assert db.pareto_front[0].score == -0.5

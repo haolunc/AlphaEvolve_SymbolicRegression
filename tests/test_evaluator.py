@@ -7,25 +7,25 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from alpha_evolve_sr.code_manipulation import ParsedFunction
-from alpha_evolve_sr.evaluator import Evaluator, Sandbox, _extract_python, _sample_to_program
+from alpha_evolve_sr.evaluator import Evaluator, Sandbox, _extract_python_text, _sample_to_program
 from alpha_evolve_sr.messages import EvalResult, LLMResponse, SampleMessage
 from tests.conftest import SAMPLE_EVALUATE_CODE, SAMPLE_SEED_FUNCTION
 
 
 class TestExtractPython:
-    """Tests for _extract_python helper."""
+    """Tests for _extract_python_text helper."""
 
     def test_extracts_from_code_fence(self):
         text = "Here is the code:\n```python\nreturn x * 2\n```\nDone."
-        assert _extract_python(text) == "\nreturn x * 2\n"
+        assert _extract_python_text(text) == "\nreturn x * 2\n"
 
     def test_returns_raw_when_no_fence(self):
         text = "return x * 2"
-        assert _extract_python(text) == "return x * 2"
+        assert _extract_python_text(text) == "return x * 2"
 
     def test_extracts_first_python_block(self):
         text = "```python\nblock1\n```\nmore text\n```python\nblock2\n```"
-        assert _extract_python(text) == "\nblock1\n"
+        assert _extract_python_text(text) == "\nblock1\n"
 
 
 class TestSampleToProgram:

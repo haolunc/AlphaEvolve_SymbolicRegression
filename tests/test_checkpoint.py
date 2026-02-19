@@ -45,11 +45,20 @@ class TestCheckpointDB:
         assert "profiler_stats" in tables
         assert "profiler_per_complexity" in tables
 
+    def test_memory_db(self):
+        """CheckpointDB supports :memory: path without errors."""
+        db = CheckpointDB(":memory:")
+        with db.transaction():
+            db.insert_program(_make_program(1, score=-0.5))
+        programs = db.load_programs()
+        assert 1 in programs
+        db.close()
+
     def test_insert_and_load_program(self, tmp_path):
         db = CheckpointDB(str(tmp_path / "test.db"))
         prog = _make_program(1, score=-0.5, complexity=10)
         with db.transaction():
-            db.insert_program(prog, island_id=0, llm_response_text="return x * 2")
+            db.insert_program(prog, llm_response_text="return x * 2")
         programs = db.load_programs()
         db.close()
         assert 1 in programs
@@ -76,16 +85,16 @@ class TestCheckpointDB:
 
     def test_island_programs_crud(self, tmp_path):
         db = CheckpointDB(str(tmp_path / "test.db"))
-        prog1 = _make_program(1)
-        prog2 = _make_program(2)
-        prog3 = _make_program(3)
+        prog1 = _make_program(1, score=-1.0)
+        prog2 = _make_program(2, score=-0.5)
+        prog3 = _make_program(3, score=-0.3)
         with db.transaction():
             db.insert_program(prog1)
             db.insert_program(prog2)
             db.insert_program(prog3)
-            db.insert_island_program(0, 0, 1)
-            db.insert_island_program(0, 0, 2)
-            db.insert_island_program(0, 1, 3)
+            db.insert_island_program(0, 0, 1, score=-1.0)
+            db.insert_island_program(0, 0, 2, score=-0.5)
+            db.insert_island_program(0, 1, 3, score=-0.3)
         memberships = db.load_island_memberships()
         assert memberships[0][0] == [1, 2]
         assert memberships[0][1] == [3]
@@ -102,7 +111,7 @@ class TestCheckpointDB:
         prog = _make_program(1)
         with db.transaction():
             db.insert_program(prog)
-            db.insert_island_program(0, 0, 1)
+            db.insert_island_program(0, 0, 1, score=-1.0)
         assert db.load_island_memberships()[0][0] == [1]
 
         with db.transaction():
@@ -175,6 +184,60 @@ class TestCheckpointDB:
     def test_checkpoint_error_on_bad_path(self):
         with pytest.raises(CheckpointError, match="Failed to open"):
             CheckpointDB("/nonexistent/deeply/nested/path/that/cannot/exist/test.db")
+
+    def test_load_programs_by_ids(self, tmp_path):
+        db = CheckpointDB(str(tmp_path / "test.db"))
+        with db.transaction():
+            db.insert_program(_make_program(1, score=-1.0))
+            db.insert_program(_make_program(2, score=-0.5))
+            db.insert_program(_make_program(3, score=-0.3))
+        result = db.load_programs_by_ids([1, 3])
+        assert set(result.keys()) == {1, 3}
+        assert result[1].score == -1.0
+        assert result[3].score == -0.3
+
+        # Empty list returns empty dict
+        assert db.load_programs_by_ids([]) == {}
+        db.close()
+
+    def test_load_island_index(self, tmp_path):
+        db = CheckpointDB(str(tmp_path / "test.db"))
+        with db.transaction():
+            db.insert_program(_make_program(1, score=-1.0))
+            db.insert_program(_make_program(2, score=-0.5))
+            db.insert_program(_make_program(3, score=-0.3))
+            db.insert_island_program(0, 0, 1, score=-1.0)
+            db.insert_island_program(0, 0, 2, score=-0.5)
+            db.insert_island_program(1, 1, 3, score=-0.3)
+        index = db.load_island_index()
+        assert index[0][0] == [(1, -1.0), (2, -0.5)]
+        assert index[1][1] == [(3, -0.3)]
+        db.close()
+
+    def test_checkpoint_island_index(self, tmp_path):
+        """checkpoint_island_index replaces all island_programs rows."""
+        from alpha_evolve_sr.database import Island
+
+        db = CheckpointDB(str(tmp_path / "test.db"))
+        with db.transaction():
+            db.insert_program(_make_program(1, score=-1.0))
+            db.insert_program(_make_program(2, score=-0.5))
+            # Start with one entry
+            db.insert_island_program(0, 0, 1, score=-1.0)
+
+        # Create islands with new state
+        island0 = Island(functions_per_prompt=2, complexity_bin_size=10, cluster_max_size=100)
+        island0._bins = {0: [(1, -1.0), (2, -0.5)]}
+        island1 = Island(functions_per_prompt=2, complexity_bin_size=10, cluster_max_size=100)
+
+        with db.transaction():
+            db.checkpoint_island_index([island0, island1], num_islands=2)
+
+        index = db.load_island_index()
+        assert 0 in index
+        assert index[0][0] == [(1, -1.0), (2, -0.5)]
+        assert 1 not in index  # island1 was empty
+        db.close()
 
 
 class TestConfigSaveLoad:

@@ -63,6 +63,100 @@ def _softmax(logits: np.ndarray, temperature: float) -> np.ndarray:
     return result
 
 
+class Island:
+    """Lightweight in-memory index for fast sampling."""
+
+    def __init__(
+        self,
+        functions_per_prompt: int,
+        complexity_bin_size: int,
+        cluster_max_size: int,
+    ) -> None:
+        self._functions_per_prompt = functions_per_prompt
+        self._complexity_bin_size = complexity_bin_size
+        self._cluster_max_size = cluster_max_size
+        self._bins: dict[int, list[tuple[int, float]]] = {}  # complexity_bin -> [(gsn, score)]
+
+    @property
+    def num_clusters(self) -> int:
+        """The number of complexity-bin clusters on this island."""
+        return len(self._bins)
+
+    @property
+    def num_programs(self) -> int:
+        """The total number of programs registered on this island."""
+        return sum(len(entries) for entries in self._bins.values())
+
+    def register(self, gsn: int, score: float, complexity: int) -> None:
+        """Add (gsn, score) to appropriate bin, prune if needed."""
+        cbin = complexity // self._complexity_bin_size
+        self._bins.setdefault(cbin, []).append((gsn, score))
+        if len(self._bins[cbin]) > self._cluster_max_size:
+            self._prune(cbin)
+
+    def _prune(self, cbin: int) -> None:
+        """Keep top cluster_max_size entries by score."""
+        entries = self._bins[cbin]
+        entries.sort(key=lambda x: x[1])  # sort by score ascending
+        self._bins[cbin] = entries[-self._cluster_max_size:]
+
+    def sample_gsns(
+        self,
+        temperature: float,
+        pareto_front: list[code_manipulation.EvaluatedProgram] | None = None,
+    ) -> list[int]:
+        """Sample global_sample_nums for prompt generation.
+
+        Returns list of gsns (one per chosen complexity bin).
+        """
+        bins = list(self._bins.keys())
+        if not bins:
+            return []
+        n = min(len(bins), self._functions_per_prompt)
+
+        if pareto_front and len(pareto_front) >= 2:
+            weights = self._pareto_weights(bins, pareto_front)
+            idx = np.random.choice(len(bins), size=n, p=weights)
+        else:
+            idx = np.random.choice(len(bins), size=n)
+
+        sampled = []
+        for i in idx:
+            cbin = bins[i]
+            entries = self._bins[cbin]
+            scores = np.array([s for _, s in entries])
+            probs = _softmax(scores, temperature)
+            chosen = np.random.choice(len(entries), p=probs)
+            sampled.append(entries[chosen][0])  # gsn
+        return sampled
+
+    def _pareto_weights(
+        self,
+        bins: list[int],
+        pareto_front: list[code_manipulation.EvaluatedProgram],
+    ) -> np.ndarray:
+        """Compute Pareto-aware bin selection weights."""
+        pareto_complexities = np.array([p.complexity for p in pareto_front], dtype=float)
+        pareto_scores = np.array([p.score for p in pareto_front], dtype=float)
+
+        weights = np.ones(len(bins), dtype=float)
+        for i, bin_key in enumerate(bins):
+            bin_center = bin_key * self._complexity_bin_size + self._complexity_bin_size / 2.0
+            target = float(np.interp(bin_center, pareto_complexities, pareto_scores))
+            cluster_best = max(s for _, s in self._bins[bin_key])
+            gap = max(0.0, target - cluster_best)
+            weights[i] = 1.0 + gap
+
+        total = weights.sum()
+        if total == 0:
+            return np.ones(len(bins)) / len(bins)
+        return weights / total
+
+    def clear(self) -> None:
+        """Reset island to empty state."""
+        self._bins.clear()
+
+
 class ProgramsDatabase:
     """A collection of programs, organized as islands."""
 
@@ -85,8 +179,9 @@ class ProgramsDatabase:
 
         self._islands: list[Island] = [
             Island(
-                prompt_text, config.functions_per_prompt,
-                config.complexity_bin_size, config.cluster_max_size,
+                config.functions_per_prompt,
+                config.complexity_bin_size,
+                config.cluster_max_size,
             )
             for _ in range(config.num_islands)
         ]
@@ -103,8 +198,12 @@ class ProgramsDatabase:
 
         # Lifecycle / checkpoint management
         self._ckpt_dir = ckpt_dir
-        self._checkpoint_db = checkpoint_db
+        if checkpoint_db is None:
+            self._checkpoint_db = CheckpointDB(":memory:")
+        else:
+            self._checkpoint_db = checkpoint_db
         self._max_samples = max_samples
+        self._steps_since_checkpoint = 0
 
     @property
     def sample_count(self) -> int:
@@ -203,36 +302,20 @@ class ProgramsDatabase:
 
     def _restore_from_db(self, checkpoint_db: CheckpointDB) -> None:
         """Reconstruct in-memory state from a populated CheckpointDB."""
-        # Load all programs
-        all_programs = checkpoint_db.load_programs()
+        # Load island index directly into lightweight Island._bins
+        index = checkpoint_db.load_island_index()
+        for island_id, bins in index.items():
+            if island_id < len(self._islands):
+                self._islands[island_id]._bins = bins
 
-        # Load island memberships and reconstruct islands
-        memberships = checkpoint_db.load_island_memberships()
-        for island_id, bins in memberships.items():
-            if island_id >= len(self._islands):
-                continue
-            island = self._islands[island_id]
-            for complexity_bin, gsn_list in bins.items():
-                progs_in_bin = [all_programs[gsn] for gsn in gsn_list if gsn in all_programs]
-                if not progs_in_bin:
-                    continue
-                if complexity_bin not in island._clusters:
-                    island._clusters[complexity_bin] = Cluster(
-                        complexity_bin, progs_in_bin[0], island._cluster_max_size,
-                    )
-                    island._num_programs += 1
-                    for p in progs_in_bin[1:]:
-                        island._clusters[complexity_bin].register_program(p)
-                        island._num_programs += 1
-                else:
-                    for p in progs_in_bin:
-                        island._clusters[complexity_bin].register_program(p)
-                        island._num_programs += 1
-
-        # Load pareto front
+        # Load pareto front (only the specific programs, not all)
         pareto_ids = checkpoint_db.load_pareto_front_ids()
-        self._pareto_front = [all_programs[gsn] for gsn in pareto_ids if gsn in all_programs]
-        self._pareto_front.sort(key=lambda p: p.complexity)
+        if pareto_ids:
+            pareto_programs = checkpoint_db.load_programs_by_ids(pareto_ids)
+            self._pareto_front = sorted(
+                [pareto_programs[gsn] for gsn in pareto_ids if gsn in pareto_programs],
+                key=lambda p: p.complexity,
+            )
 
         # Load metadata
         meta = checkpoint_db.load_metadata()
@@ -245,9 +328,12 @@ class ProgramsDatabase:
                 self._best_score_per_island[i] = s
 
         best_prog_ids = meta.get("best_program_per_island", [None] * len(self._islands))
-        for i, gsn in enumerate(best_prog_ids):
-            if i < len(self._best_program_per_island) and gsn is not None and gsn in all_programs:
-                self._best_program_per_island[i] = all_programs[gsn]
+        gsns_to_load = [gsn for gsn in best_prog_ids if gsn is not None]
+        if gsns_to_load:
+            best_programs = checkpoint_db.load_programs_by_ids(gsns_to_load)
+            for i, gsn in enumerate(best_prog_ids):
+                if i < len(self._best_program_per_island) and gsn is not None and gsn in best_programs:
+                    self._best_program_per_island[i] = best_programs[gsn]
 
         # Restore profiler
         profiler_stats = checkpoint_db.load_profiler_stats()
@@ -276,22 +362,63 @@ class ProgramsDatabase:
             1 - (self._global_sample_nums % period) / period
         )
         pareto = self._pareto_front if self._config.pareto_aware else None
-        code = self._islands[island_id].get_prompt(temperature, pareto)
+
+        # 1. Sample gsns from in-memory island (fast)
+        gsns = self._islands[island_id].sample_gsns(temperature, pareto)
+
+        # 2. Load full programs from DB (only for prompt text generation)
+        programs = self._checkpoint_db.load_programs_by_ids(gsns)
+        implementations = [programs[gsn] for gsn in gsns if gsn in programs]
+
+        # 3. Sort by score and generate prompt
+        implementations.sort(key=lambda p: p.score)
+        code = self._generate_prompt(implementations)
         return Prompt(code, island_id)
+
+    def _generate_prompt(self, implementations: Sequence[code_manipulation.EvaluatedProgram]) -> str:
+        """Creates a prompt containing a sequence of function *implementations*."""
+        versioned_functions: list[code_manipulation.ParsedFunction] = []
+        for i, impl in enumerate(implementations):
+            new_function_name = f"{self._function_to_evolve}_v{i}"
+            func = dataclasses.replace(impl.parsed, name=new_function_name)
+            if i >= 1:
+                doc = f"Improved version of `{self._function_to_evolve}_v{i - 1}`."
+                func = dataclasses.replace(func, docstring=doc)
+            renamed_code = code_manipulation.rename_function_calls(
+                str(func), self._function_to_evolve, new_function_name
+            )
+            versioned_functions.append(code_manipulation.text_to_function(renamed_code))
+
+        next_version = len(implementations)
+        new_function_name = f"{self._function_to_evolve}_v{next_version}"
+        header = dataclasses.replace(
+            implementations[-1].parsed,
+            name=new_function_name,
+            body="",
+            docstring=f"Improved version of `{self._function_to_evolve}_v{next_version - 1}`.",
+        )
+
+        prompt_pre = self._prompt_text
+        prompt_mid = _get_prompt_mid(next_version - 1)
+        prompt = (
+            prompt_pre
+            + prompt_mid
+            + "\n".join(str(fun) for fun in versioned_functions)
+            + "\n```\nNow define: \n```python\n"
+            + str(header)
+            + "\n```"
+        )
+        return prompt
 
     def _register_program_in_island(
         self,
-        program: code_manipulation.EvaluatedProgram,
+        gsn: int,
+        score: float,
+        complexity: int,
         island_id: int,
-    ) -> list[int]:
-        """Registers *program* in the specified island. Returns evicted IDs."""
-        evicted = self._islands[island_id].register_program(program)
-        score = program.score
-
-        if score > self._best_score_per_island[island_id]:
-            self._best_score_per_island[island_id] = score
-            self._best_program_per_island[island_id] = program
-            logger.info("Best score of island %d increased to %s", island_id, score)
+    ) -> None:
+        """Registers a program entry in the specified island's in-memory index."""
+        self._islands[island_id].register(gsn, score, complexity)
 
         island = self._islands[island_id]
         logger.debug(
@@ -300,7 +427,6 @@ class ProgramsDatabase:
             island.num_clusters,
             island.num_programs,
         )
-        return evicted
 
     def register_program(
         self,
@@ -341,62 +467,73 @@ class ProgramsDatabase:
 
         db = self._checkpoint_db
 
-        if db:
-            with db.transaction():
-                self._register_and_persist(evaluated, island_id, ex, db, llm_response_text)
-        else:
-            self._register_and_persist(evaluated, island_id, ex, None, None)
+        with db.transaction():
+            self._register_and_persist(evaluated, island_id, ex, db, llm_response_text)
 
     def _register_and_persist(
         self,
         evaluated: code_manipulation.EvaluatedProgram,
         island_id: int | None,
         ex: object | None,
-        db: CheckpointDB | None,
+        db: CheckpointDB,
         llm_response_text: str | None,
     ) -> None:
-        """Core registration + optional DB persistence (runs inside a transaction)."""
-        if db:
-            db.insert_program(evaluated, island_id=island_id, llm_response_text=llm_response_text)
+        """Core registration + DB persistence (runs inside a transaction)."""
+        db.insert_program(evaluated, llm_response_text=llm_response_text)
 
         if ex is not None:
+            gsn = evaluated.global_sample_nums
+            score = evaluated.score
+            complexity = evaluated.complexity
+
             if island_id is None:
                 for iid in range(len(self._islands)):
-                    evicted = self._register_program_in_island(evaluated, iid)
-                    if db:
-                        complexity_bin = evaluated.complexity // self._config.complexity_bin_size
-                        db.insert_island_program(iid, complexity_bin, evaluated.global_sample_nums)
-                        db.delete_island_programs(iid, evicted)
+                    self._register_program_in_island(gsn, score, complexity, iid)
             else:
-                evicted = self._register_program_in_island(evaluated, island_id)
-                if db:
-                    complexity_bin = evaluated.complexity // self._config.complexity_bin_size
-                    db.insert_island_program(island_id, complexity_bin, evaluated.global_sample_nums)
-                    db.delete_island_programs(island_id, evicted)
+                self._register_program_in_island(gsn, score, complexity, island_id)
+
+            # Track best per island
+            target_ids = range(len(self._islands)) if island_id is None else [island_id]
+            for iid in target_ids:
+                if score > self._best_score_per_island[iid]:
+                    self._best_score_per_island[iid] = score
+                    self._best_program_per_island[iid] = evaluated
+                    logger.info("Best score of island %d increased to %s", iid, score)
 
         self._update_pareto_front(evaluated)
         self._profiler.register_function(evaluated, pareto_size=len(self._pareto_front))
 
-        if db:
-            db.replace_pareto_front([p.global_sample_nums for p in self._pareto_front])
-            db.save_profiler_stats(self._profiler)
-            per_c = self._profiler.get_best_per_complexity_snapshot()
-            if evaluated.complexity is not None and evaluated.complexity in per_c:
-                score, prog_str, order = per_c[evaluated.complexity]
-                db.save_profiler_per_complexity(evaluated.complexity, score, prog_str, order)
-            db.save_metadata("global_sample_nums", self._global_sample_nums)
-            db.save_metadata("last_reset_step", self._last_reset_step)
-            db.save_metadata(
-                "best_score_per_island", self._best_score_per_island,
-            )
-            db.save_metadata(
-                "best_program_per_island",
-                [p.global_sample_nums if p else None for p in self._best_program_per_island],
-            )
+        # Periodic checkpoint of island index
+        self._steps_since_checkpoint += 1
+        if self._steps_since_checkpoint >= self._config.checkpoint_interval:
+            self._checkpoint_island_index()
+
+        db.replace_pareto_front([p.global_sample_nums for p in self._pareto_front])
+        db.save_profiler_stats(self._profiler)
+        per_c = self._profiler.get_best_per_complexity_snapshot()
+        if evaluated.complexity is not None and evaluated.complexity in per_c:
+            score_val, prog_str, order = per_c[evaluated.complexity]
+            db.save_profiler_per_complexity(evaluated.complexity, score_val, prog_str, order)
+        db.save_metadata("global_sample_nums", self._global_sample_nums)
+        db.save_metadata("last_reset_step", self._last_reset_step)
+        db.save_metadata(
+            "best_score_per_island", self._best_score_per_island,
+        )
+        db.save_metadata(
+            "best_program_per_island",
+            [p.global_sample_nums if p else None for p in self._best_program_per_island],
+        )
 
         if self._global_sample_nums - self._last_reset_step > self._config.reset_period:
             self._last_reset_step = self._global_sample_nums
             self.reset_islands()
+
+    def _checkpoint_island_index(self) -> None:
+        """Persist current in-memory island index to DB."""
+        self._checkpoint_db.checkpoint_island_index(
+            self._islands, self._config.num_islands,
+        )
+        self._steps_since_checkpoint = 0
 
     def _update_pareto_front(self, program: code_manipulation.EvaluatedProgram) -> None:
         """Update the Pareto front with *program* if it is non-dominated.
@@ -416,7 +553,7 @@ class ProgramsDatabase:
             if fp.complexity <= complexity and fp.score >= score:
                 return  # dominated
 
-        # Not dominated — add and remove any programs it dominates
+        # Not dominated -- add and remove any programs it dominates
         self._pareto_front = [
             fp for fp in self._pareto_front
             if not (complexity <= fp.complexity and score >= fp.score)
@@ -433,211 +570,15 @@ class ProgramsDatabase:
         reset_islands_ids = indices_sorted_by_score[:num_islands_to_reset]
         keep_islands_ids = indices_sorted_by_score[num_islands_to_reset:]
         for island_id in reset_islands_ids:
-            self._islands[island_id] = Island(
-                self._prompt_text,
-                self._config.functions_per_prompt,
-                self._config.complexity_bin_size,
-                self._config.cluster_max_size,
-            )
-            if self._checkpoint_db:
-                self._checkpoint_db.reset_island(int(island_id))
+            self._islands[island_id].clear()
             founder_island_id = np.random.choice(keep_islands_ids)
             founder = self._best_program_per_island[founder_island_id]
-            evicted = self._register_program_in_island(founder, island_id)
-            if self._checkpoint_db:
-                complexity_bin = founder.complexity // self._config.complexity_bin_size
-                self._checkpoint_db.insert_island_program(
-                    int(island_id), complexity_bin, founder.global_sample_nums,
-                )
-                self._checkpoint_db.delete_island_programs(int(island_id), evicted)
-            logger.info("Reset island %d with founder %d", island_id, founder.global_sample_nums)
-
-
-class Island:
-    """A sub-population of the programs database."""
-
-    def __init__(
-        self,
-        prompt_text: str,
-        functions_per_prompt: int,
-        complexity_bin_size: int = 10,
-        cluster_max_size: int = 100,
-    ) -> None:
-        self._prompt_text = prompt_text
-        self._function_to_evolve = "equation"
-        self._functions_per_prompt = functions_per_prompt
-        self._complexity_bin_size = complexity_bin_size
-        self._cluster_max_size = cluster_max_size
-
-        self._clusters: dict[int, Cluster] = {}
-        self._num_programs: int = 0
-
-    @property
-    def num_clusters(self) -> int:
-        """The number of complexity-bin clusters on this island."""
-        return len(self._clusters)
-
-    @property
-    def num_programs(self) -> int:
-        """The total number of programs registered on this island."""
-        return self._num_programs
-
-    def register_program(self, program: code_manipulation.EvaluatedProgram) -> list[int]:
-        """Stores a program on this island, in its appropriate cluster.
-
-        Returns a list of ``global_sample_nums`` that were evicted (empty if none).
-        """
-        complexity_bin = program.complexity // self._complexity_bin_size
-        if complexity_bin not in self._clusters:
-            self._clusters[complexity_bin] = Cluster(complexity_bin, program, self._cluster_max_size)
-            logger.debug("Created new cluster with complexity_bin %d", complexity_bin)
-            evicted: list[int] = []
-        else:
-            evicted = self._clusters[complexity_bin].register_program(program)
-            logger.debug("Added program to existing cluster with complexity_bin %d", complexity_bin)
-        self._num_programs += 1
-        return evicted
-
-    def get_prompt(
-        self,
-        temperature: float,
-        pareto_front: list[code_manipulation.EvaluatedProgram] | None = None,
-    ) -> str:
-        """Constructs a prompt containing functions from this island."""
-        complexity_bins = list(self._clusters.keys())
-
-        functions_per_prompt = min(len(self._clusters), self._functions_per_prompt)
-
-        if pareto_front and len(pareto_front) >= 2:
-            weights = self._pareto_weights(complexity_bins, pareto_front)
-            idx = np.random.choice(len(complexity_bins), size=functions_per_prompt, p=weights)
-        else:
-            idx = np.random.choice(len(complexity_bins), size=functions_per_prompt)
-        chosen_bins = [complexity_bins[i] for i in idx]
-
-        implementations = []
-        scores = []
-        for complexity_bin in chosen_bins:
-            cluster = self._clusters[complexity_bin]
-            sampled_program = cluster.sample_program(temperature)
-            implementations.append(sampled_program)
-            scores.append(sampled_program.score)
-
-        logger.debug("Selected %d clusters with complexity_bins: %s", len(chosen_bins), chosen_bins)
-
-        indices = np.argsort(scores)
-        sorted_implementations = [implementations[i] for i in indices]
-        return self._generate_prompt(sorted_implementations)
-
-    def _pareto_weights(
-        self,
-        complexity_bins: list[int],
-        pareto_front: list[code_manipulation.EvaluatedProgram],
-    ) -> np.ndarray:
-        """Compute selection weights favouring bins with Pareto improvement potential.
-
-        For each complexity bin, the weight is ``1 + gap`` where *gap* is the
-        positive difference between the Pareto-front-interpolated score at that
-        complexity and the cluster's current best score.  Bins with large gaps
-        (lagging behind the front) receive more exploration pressure.
-        """
-        pareto_complexities = np.array([p.complexity for p in pareto_front], dtype=float)
-        pareto_scores = np.array([p.score for p in pareto_front], dtype=float)
-
-        weights = np.ones(len(complexity_bins), dtype=float)
-        for i, bin_key in enumerate(complexity_bins):
-            bin_center = bin_key * self._complexity_bin_size + self._complexity_bin_size / 2.0
-            target = float(np.interp(bin_center, pareto_complexities, pareto_scores))
-            cluster_best = max(self._clusters[bin_key]._scores)
-            gap = max(0.0, target - cluster_best)
-            weights[i] = 1.0 + gap
-
-        total = weights.sum()
-        if total == 0:
-            return np.ones(len(complexity_bins)) / len(complexity_bins)
-        return weights / total
-
-    def _generate_prompt(self, implementations: Sequence[code_manipulation.EvaluatedProgram]) -> str:
-        """Creates a prompt containing a sequence of function *implementations*."""
-        versioned_functions: list[code_manipulation.ParsedFunction] = []
-        for i, impl in enumerate(implementations):
-            new_function_name = f"{self._function_to_evolve}_v{i}"
-            func = dataclasses.replace(impl.parsed, name=new_function_name)
-            if i >= 1:
-                doc = f"Improved version of `{self._function_to_evolve}_v{i - 1}`."
-                func = dataclasses.replace(func, docstring=doc)
-            renamed_code = code_manipulation.rename_function_calls(
-                str(func), self._function_to_evolve, new_function_name
+            self._islands[island_id].register(
+                founder.global_sample_nums, founder.score, founder.complexity,
             )
-            versioned_functions.append(code_manipulation.text_to_function(renamed_code))
-
-        next_version = len(implementations)
-        new_function_name = f"{self._function_to_evolve}_v{next_version}"
-        header = dataclasses.replace(
-            implementations[-1].parsed,
-            name=new_function_name,
-            body="",
-            docstring=f"Improved version of `{self._function_to_evolve}_v{next_version - 1}`.",
-        )
-
-        prompt_pre = self._prompt_text
-        prompt_mid = _get_prompt_mid(next_version - 1)
-        prompt = (
-            prompt_pre
-            + prompt_mid
-            + "\n".join(str(fun) for fun in versioned_functions)
-            + "\n```\nNow define: \n```python\n"
-            + str(header)
-            + "\n```"
-        )
-        return prompt
-
-
-class Cluster:
-    """A cluster of programs on the same island and with the same complexity bin."""
-
-    def __init__(self, complexity_bin: int, implementation: code_manipulation.EvaluatedProgram, max_size: int = 100):
-        self._complexity_bin = complexity_bin
-        self._max_size = max_size
-        self._programs: list[code_manipulation.EvaluatedProgram] = [implementation]
-        self._scores: list[float] = [implementation.score]
-
-    def register_program(self, program: code_manipulation.EvaluatedProgram) -> list[int]:
-        """Adds *program* to the cluster, pruning if over max size.
-
-        Returns a list of ``global_sample_nums`` that were evicted (empty if none).
-        """
-        self._programs.append(program)
-        self._scores.append(program.score)
-        logger.debug("Added program of score %s to cluster with complexity_bin %d", program.score, self._complexity_bin)
-        if len(self._programs) > self._max_size:
-            return self._prune()
-        return []
-
-    def _prune(self) -> list[int]:
-        """Remove lowest-scoring programs to stay within *_max_size*.
-
-        Returns a list of ``global_sample_nums`` that were evicted.
-        """
-        keep_indices = set(np.argsort(self._scores)[-self._max_size:])
-        all_indices = set(range(len(self._programs)))
-        evicted_indices = all_indices - keep_indices
-        evicted_ids = [self._programs[i].global_sample_nums for i in evicted_indices]
-
-        keep_sorted = sorted(keep_indices)
-        self._programs = [self._programs[i] for i in keep_sorted]
-        self._scores = [self._scores[i] for i in keep_sorted]
-        logger.debug("Pruned cluster %d to %d programs", self._complexity_bin, len(self._programs))
-        return evicted_ids
-
-    def sample_program(self, temperature: float) -> code_manipulation.EvaluatedProgram:
-        """Samples a program, giving higher probability to higher-scoring programs."""
-        probabilities = _softmax(np.array(self._scores), temperature)
-        chosen_idx = np.random.choice(len(self._programs), p=probabilities)
-        chosen_program = self._programs[chosen_idx]
-        logger.debug(
-            "Sampled program with score %s from cluster with %d programs",
-            self._scores[chosen_idx],
-            len(self._programs),
-        )
-        return chosen_program
+            # Update cached best
+            self._best_score_per_island[island_id] = founder.score
+            self._best_program_per_island[island_id] = founder
+            logger.info("Reset island %d with founder %d", island_id, founder.global_sample_nums)
+        # Force checkpoint after reset
+        self._checkpoint_island_index()

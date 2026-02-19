@@ -49,6 +49,7 @@ class ProgramsDatabaseConfig:
     complexity_bin_size: int = 10
     cluster_max_size: int = 100
     pareto_aware: bool = False
+    checkpoint_interval: int = 10
 
 
 @dataclasses.dataclass(frozen=True)
@@ -113,6 +114,21 @@ class WorkerConfig:
     monitor_interval_seconds: int = 300
 
 
+def _coerce_int_fields(dc_cls: type, data: dict) -> None:
+    """Convert float values to int for fields typed as int.
+
+    YAML parses ``10.`` as ``10.0``.  This silently fixes that so that
+    ``range()`` and other int-only call sites don't crash.
+    """
+    int_fields = {
+        f.name for f in dataclasses.fields(dc_cls) if f.type in ("int", int)
+    }
+    for key in int_fields & data.keys():
+        val = data[key]
+        if isinstance(val, float) and val.is_integer():
+            data[key] = int(val)
+
+
 @dataclasses.dataclass
 class RunConfig:
     """Top-level configuration for a pipeline run.
@@ -170,6 +186,19 @@ class RunConfig:
                 f"Error: unknown config keys: {sorted(unknown)}. "
                 f"Valid top-level keys: {sorted(known_fields)}"
             )
+
+        # Coerce float→int where the dataclass expects int (YAML parses
+        # "10." as 10.0 instead of 10).
+        sub_configs = {
+            SamplerConfig: sampler_data,
+            ProgramsDatabaseConfig: database_data,
+            EvaluatorConfig: evaluator_data,
+            ProfilerConfig: profiler_data,
+            WorkerConfig: worker_data,
+        }
+        for dc_cls, dc_data in sub_configs.items():
+            _coerce_int_fields(dc_cls, dc_data)
+        _coerce_int_fields(cls, data)
 
         return cls(
             sampler=SamplerConfig(**sampler_data),

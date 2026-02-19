@@ -1,9 +1,9 @@
 # =====================================================================
 # Required — fill these in before running
 # =====================================================================
-problem_dir:         # Path to problem directory (e.g. specs/dft_xc/)
-data_folder:       # Path to data folder containing train.csv
-log_folder:         # Name for this experiment's log directory
+problem_dir: examples/dft_xc/        # Path to problem directory (e.g. specs/dft_xc/)
+data_folder: examples/data/dft_ev_xc        # Path to data folder containing train.csv
+log_folder: examples/log/         # Name for this experiment's log directory
 
 # =====================================================================
 # Pipeline

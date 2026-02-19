@@ -267,7 +267,7 @@ that slow consumers are not overwhelmed.
 The `Evaluator.analyse()` method transforms raw LLM text into a scored
 `EvalResult` in these steps:
 
-1. **Extract Python code** — `_extract_python(text)` strips the
+1. **Extract Python code** — `_extract_python_text(text)` strips the
    `` ```python `` fences from the LLM response. If no fences are found,
    the raw text is used as-is.
 

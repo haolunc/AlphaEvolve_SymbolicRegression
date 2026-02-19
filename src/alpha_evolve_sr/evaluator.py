@@ -34,7 +34,7 @@ from .messages import EvalResult, ExecutionResult, SampleMessage
 logger = get_logger("evaluator")
 
 
-def _extract_python(text: str) -> str:
+def _extract_python_text(text: str) -> str:
     """Extract python code block from LLM response text."""
     if "```python" in text:
         return text.split("```python")[1].split("```")[0]
@@ -208,7 +208,7 @@ class Evaluator:
         """
         try:
             sample_function_body = code_manipulation.text_to_function(
-                _extract_python(sample_message.llm_response.response_text)
+                _extract_python_text(sample_message.llm_response.response_text)
             ).body
         except Exception as e:
             logger.error("Error parsing sample: %s\n %s", e, sample_message.llm_response.response_text)

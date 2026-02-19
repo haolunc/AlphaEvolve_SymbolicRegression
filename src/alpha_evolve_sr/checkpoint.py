@@ -88,7 +88,6 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS programs (
     global_sample_num   INTEGER PRIMARY KEY,
-    island_id           INTEGER,
     func_name           TEXT    NOT NULL,
     func_args           TEXT    NOT NULL,
     func_body           TEXT    NOT NULL,
@@ -110,6 +109,7 @@ CREATE TABLE IF NOT EXISTS island_programs (
     island_id           INTEGER NOT NULL,
     complexity_bin      INTEGER NOT NULL,
     global_sample_num   INTEGER NOT NULL REFERENCES programs(global_sample_num),
+    score               REAL    NOT NULL,
     PRIMARY KEY (island_id, global_sample_num)
 );
 CREATE INDEX IF NOT EXISTS idx_ip_island_bin ON island_programs(island_id, complexity_bin);
@@ -144,14 +144,38 @@ CREATE TABLE IF NOT EXISTS profiler_per_complexity (
 """
 
 
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Migrate old schema to current if needed."""
+    # Check if programs table has island_id column (old schema)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(programs)").fetchall()}
+    if "island_id" in cols:
+        # SQLite can't drop columns easily; just leave island_id in place.
+        logger.info("Old schema detected: programs.island_id present (kept for compatibility)")
+
+    # Check if island_programs table has score column
+    ip_cols = {row[1] for row in conn.execute("PRAGMA table_info(island_programs)").fetchall()}
+    if "score" not in ip_cols:
+        logger.info("Migrating island_programs: adding score column")
+        conn.execute("ALTER TABLE island_programs ADD COLUMN score REAL NOT NULL DEFAULT 0.0")
+        # Backfill score from programs table
+        conn.execute(
+            "UPDATE island_programs SET score = "
+            "(SELECT p.score FROM programs p WHERE p.global_sample_num = island_programs.global_sample_num)"
+        )
+        conn.commit()
+        logger.info("Migration complete: island_programs.score backfilled")
+
+
 class CheckpointDB:
     """SQLite-backed incremental checkpoint store."""
 
     def __init__(self, db_path: str) -> None:
         try:
-            os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+            if db_path != ":memory:":
+                os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
             self._conn = sqlite3.connect(db_path, timeout=30)
             self._conn.executescript(_SCHEMA_SQL)
+            _migrate_schema(self._conn)
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.execute("PRAGMA synchronous = NORMAL")
             self._conn.execute("PRAGMA foreign_keys = ON")
@@ -182,7 +206,6 @@ class CheckpointDB:
     def insert_program(
         self,
         program: code_manipulation.EvaluatedProgram,
-        island_id: int | None = None,
         llm_response_text: str | None = None,
     ) -> None:
         token_input = program.token_usage[0] if program.token_usage else None
@@ -199,15 +222,14 @@ class CheckpointDB:
 
         self._conn.execute(
             """INSERT OR REPLACE INTO programs (
-                global_sample_num, island_id, func_name, func_args, func_body,
+                global_sample_num, func_name, func_args, func_body,
                 func_return_type, func_docstring, score, optimized_params,
                 complexity, complexity_detail, sample_time, evaluate_time,
                 token_usage_input, token_usage_output, token_cost,
                 llm_response_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 program.global_sample_nums,
-                island_id,
                 program.parsed.name,
                 program.parsed.args,
                 program.parsed.body,
@@ -228,10 +250,11 @@ class CheckpointDB:
 
     def insert_island_program(
         self, island_id: int, complexity_bin: int, global_sample_num: int,
+        score: float,
     ) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO island_programs (island_id, complexity_bin, global_sample_num) VALUES (?, ?, ?)",
-            (island_id, complexity_bin, global_sample_num),
+            "INSERT OR REPLACE INTO island_programs (island_id, complexity_bin, global_sample_num, score) VALUES (?, ?, ?, ?)",
+            (island_id, complexity_bin, global_sample_num, score),
         )
 
     def delete_island_programs(self, island_id: int, evicted_ids: list[int]) -> None:
@@ -247,6 +270,19 @@ class CheckpointDB:
         self._conn.execute(
             "DELETE FROM island_programs WHERE island_id = ?", (island_id,),
         )
+
+    def checkpoint_island_index(
+        self, islands: list, num_islands: int,
+    ) -> None:
+        """Replace all island_programs rows with current in-memory state."""
+        self._conn.execute("DELETE FROM island_programs")
+        for island_id in range(num_islands):
+            for cbin, entries in islands[island_id]._bins.items():
+                for gsn, score in entries:
+                    self._conn.execute(
+                        "INSERT INTO island_programs VALUES (?, ?, ?, ?)",
+                        (island_id, cbin, gsn, score),
+                    )
 
     def replace_pareto_front(self, front_ids: list[int]) -> None:
         self._conn.execute("DELETE FROM pareto_front")
@@ -294,16 +330,29 @@ class CheckpointDB:
 
     # ---- Read operations -------------------------------------------------
 
-    def load_programs(self) -> dict[int, code_manipulation.EvaluatedProgram]:
-        rows = self._conn.execute("SELECT * FROM programs").fetchall()
+    def _rows_to_programs(
+        self, rows: list[tuple],
+    ) -> dict[int, code_manipulation.EvaluatedProgram]:
+        """Convert raw SQL rows into EvaluatedProgram objects."""
         programs: dict[int, code_manipulation.EvaluatedProgram] = {}
         for row in rows:
-            (
-                gsn, _island_id, func_name, func_args, func_body,
-                func_return_type, func_docstring, score, opt_params_json,
-                complexity, complexity_detail_json, sample_time, evaluate_time,
-                token_input, token_output, token_cost, _llm_text,
-            ) = row
+            # Handle both old schema (with island_id) and new schema (without)
+            if len(row) == 17:
+                # Old schema: has island_id column
+                (
+                    gsn, _island_id, func_name, func_args, func_body,
+                    func_return_type, func_docstring, score, opt_params_json,
+                    complexity, complexity_detail_json, sample_time, evaluate_time,
+                    token_input, token_output, token_cost, _llm_text,
+                ) = row
+            else:
+                # New schema: no island_id column
+                (
+                    gsn, func_name, func_args, func_body,
+                    func_return_type, func_docstring, score, opt_params_json,
+                    complexity, complexity_detail_json, sample_time, evaluate_time,
+                    token_input, token_output, token_cost, _llm_text,
+                ) = row
             parsed = code_manipulation.ParsedFunction(
                 name=func_name,
                 args=func_args,
@@ -329,8 +378,44 @@ class CheckpointDB:
             )
         return programs
 
+    def load_programs(self) -> dict[int, code_manipulation.EvaluatedProgram]:
+        rows = self._conn.execute("SELECT * FROM programs").fetchall()
+        return self._rows_to_programs(rows)
+
+    def load_programs_by_ids(
+        self, gsn_list: list[int],
+    ) -> dict[int, code_manipulation.EvaluatedProgram]:
+        """Load specific programs by their global_sample_num primary keys."""
+        if not gsn_list:
+            return {}
+        placeholders = ",".join("?" * len(gsn_list))
+        rows = self._conn.execute(
+            f"SELECT * FROM programs WHERE global_sample_num IN ({placeholders})",
+            gsn_list,
+        ).fetchall()
+        return self._rows_to_programs(rows)
+
+    def load_island_index(self) -> dict[int, dict[int, list[tuple[int, float]]]]:
+        """Returns ``{island_id: {complexity_bin: [(gsn, score), ...]}}``.
+
+        Used to restore in-memory Island._bins from a checkpoint.
+        """
+        rows = self._conn.execute(
+            "SELECT island_id, complexity_bin, global_sample_num, score "
+            "FROM island_programs ORDER BY rowid",
+        ).fetchall()
+        result: dict[int, dict[int, list[tuple[int, float]]]] = {}
+        for island_id, complexity_bin, gsn, score in rows:
+            result.setdefault(island_id, {}).setdefault(complexity_bin, []).append(
+                (gsn, score),
+            )
+        return result
+
     def load_island_memberships(self) -> dict[int, dict[int, list[int]]]:
-        """Returns ``{island_id: {complexity_bin: [global_sample_num, ...]}}``."""
+        """Returns ``{island_id: {complexity_bin: [global_sample_num, ...]}}``.
+
+        Legacy convenience wrapper; prefer load_island_index for new code.
+        """
         rows = self._conn.execute(
             "SELECT island_id, complexity_bin, global_sample_num FROM island_programs ORDER BY rowid",
         ).fetchall()

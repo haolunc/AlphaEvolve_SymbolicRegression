@@ -12,4 +12,5 @@ logger/
 *.egg
 .eggs/
 .env
-scatch/
+scratch/
+docs/
