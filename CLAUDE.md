@@ -45,3 +45,9 @@ tests/                     # pytest tests
 - Use `tmp_path` pytest fixture for temporary directories (avoids teardown issues with file handles)
 - Shared fixtures in `tests/conftest.py`
 - Test classes named `Test<Component>`, test methods `test_<behavior>`
+
+## Documentation Style (Markdown)
+
+- Keep text concise — avoid long paragraphs; prefer bullet points and short sentences
+- Use visual aids liberally: Mermaid diagrams (flowcharts, sequence diagrams, class diagrams), tables, or math formulas (LaTeX `$...$`) where they clarify better than prose
+- Add a **Table of Contents** at the top if a document has more than 3 sections

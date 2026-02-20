@@ -132,7 +132,6 @@ evaluator:
   timeout_seconds: 200
 profiler:
   log_frequency: 50
-  complexity_group_size: 10
 worker:
   perf_report_interval_seconds: 60
   monitor_interval_seconds: 120
@@ -146,7 +145,6 @@ worker:
         assert config.database.num_islands == 5
         assert config.evaluator.timeout_seconds == 200
         assert config.profiler.log_frequency == 50
-        assert config.profiler.complexity_group_size == 10
         assert config.worker.perf_report_interval_seconds == 60
         assert config.worker.monitor_interval_seconds == 120
 

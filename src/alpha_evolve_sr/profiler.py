@@ -1,11 +1,14 @@
-"""Experiment profiling with TensorBoard and JSON sample logs."""
+"""Experiment profiling with TensorBoard."""
 
 from __future__ import annotations
 
-import json
+import io
 import os.path
+import time
 
 import matplotlib.pyplot as plt
+from tensorboard.compat.proto.event_pb2 import Event
+from tensorboard.compat.proto.summary_pb2 import Summary
 from tensorboard.summary.writer.event_file_writer import EventFileWriter
 
 from . import code_manipulation
@@ -16,69 +19,56 @@ logger = get_logger("profiler")
 
 
 # ---------------------------------------------------------------------------
-# TensorBoard compatibility layer
+# Minimal SummaryWriter using the standalone ``tensorboard`` package directly,
+# avoiding a PyTorch dependency.
 # ---------------------------------------------------------------------------
-# We use the standalone ``tensorboard`` package rather than
-# ``torch.utils.tensorboard`` to avoid pulling in PyTorch.  The public API
-# we need (add_scalar, add_scalars, add_text, add_figure) is provided by
-# ``tensorboard.summary.writer.event_file_writer`` under the hood.  We use
-# ``tensorflow.summary`` style if available, otherwise fall back to a thin
-# wrapper.
-try:
-    from torch.utils.tensorboard import SummaryWriter  # type: ignore[import-untyped]
-except ImportError:
-    try:
-        from tensorboardX import SummaryWriter  # type: ignore[import-untyped]
-    except ImportError:
-        class SummaryWriter:  # type: ignore[no-redef]
-            """Minimal SummaryWriter using raw tensorboard APIs."""
 
-            def __init__(self, log_dir: str | None = None):
-                self._log_dir = log_dir or "runs"
-                os.makedirs(self._log_dir, exist_ok=True)
-                self._writer = EventFileWriter(self._log_dir)
+class SummaryWriter:
+    """Minimal SummaryWriter using raw tensorboard APIs."""
 
-            def add_scalar(
-                self, tag: str, scalar_value: float, global_step: int | None = None,
-            ) -> None:
-                import time
+    def __init__(self, log_dir: str | None = None):
+        self._log_dir = log_dir or "runs"
+        os.makedirs(self._log_dir, exist_ok=True)
+        self._writer = EventFileWriter(self._log_dir)
 
-                from tensorboard.compat.proto.event_pb2 import Event
-                from tensorboard.compat.proto.summary_pb2 import Summary
+    def add_scalar(
+        self, tag: str, scalar_value: float, global_step: int | None = None,
+    ) -> None:
+        s = Summary(value=[Summary.Value(tag=tag, simple_value=scalar_value)])
+        event = Event(summary=s, wall_time=time.time(), step=global_step or 0)
+        self._writer.add_event(event)
 
-                s = Summary(value=[Summary.Value(tag=tag, simple_value=scalar_value)])
-                event = Event(summary=s, wall_time=time.time(), step=global_step or 0)
-                self._writer.add_event(event)
+    def add_scalars(
+        self, main_tag: str, tag_scalar_dict: dict[str, float],
+        global_step: int | None = None,
+    ) -> None:
+        for tag, value in tag_scalar_dict.items():
+            self.add_scalar(f"{main_tag}/{tag}", value, global_step)
 
-            def add_scalars(
-                self, main_tag: str, tag_scalar_dict: dict[str, float],
-                global_step: int | None = None,
-            ) -> None:
-                for tag, value in tag_scalar_dict.items():
-                    self.add_scalar(f"{main_tag}/{tag}", value, global_step)
+    def add_figure(
+        self, tag: str, figure: object, global_step: int | None = None,
+    ) -> None:
+        buf = io.BytesIO()
+        figure.savefig(buf, format="png")  # type: ignore[union-attr]
+        buf.seek(0)
+        image_string = buf.getvalue()
+        s = Summary(value=[Summary.Value(
+            tag=tag,
+            image=Summary.Image(
+                encoded_image_string=image_string,
+                height=0,
+                width=0,
+                colorspace=0,
+            ),
+        )])
+        event = Event(summary=s, wall_time=time.time(), step=global_step or 0)
+        self._writer.add_event(event)
 
-            def add_text(
-                self, tag: str, text_string: str, global_step: int | None = None,
-            ) -> None:
-                import time
+    def flush(self) -> None:
+        self._writer.flush()
 
-                from tensorboard.compat.proto.event_pb2 import Event
-                from tensorboard.plugins.text.summary import text_pb
-
-                meta = text_pb(tag, text_string)
-                event = Event(summary=meta, wall_time=time.time(), step=global_step or 0)
-                self._writer.add_event(event)
-
-            def add_figure(
-                self, tag: str, figure: object, global_step: int | None = None,
-            ) -> None:
-                pass  # Not supported in fallback mode
-
-            def flush(self) -> None:
-                self._writer.flush()
-
-            def close(self) -> None:
-                self._writer.close()
+    def close(self) -> None:
+        self._writer.close()
 
 
 # ---------------------------------------------------------------------------
@@ -101,48 +91,17 @@ class TensorBoardWriter:
         self,
         num_samples: int,
         best_score: float,
-        best_score_per_c: dict[int, float],
-        best_progorder_per_c: dict[int, int],
         tot_token_cost: float,
         success_count: int,
         failed_count: int,
         tot_sample_time: float,
         tot_evaluate_time: float,
-        cur_best_sample_order: int | None,
-        cur_best_program_str: str | None,
-        pareto_size: int | None = None,
+        pareto_front=None,
+        best_score_per_island=None,
+        island_sizes=None,
     ) -> None:
         """Write all metrics to TensorBoard."""
         self._writer.add_scalar("Best Score of Function", best_score, global_step=num_samples)
-
-        if pareto_size is not None:
-            self._writer.add_scalar("Pareto Front Size", pareto_size, global_step=num_samples)
-
-        if num_samples % self._config.log_frequency == 0:
-            group_size = self._config.complexity_group_size
-            grouped: dict[str, float] = {}
-            for c, s in best_score_per_c.items():
-                gk = c // group_size
-                gname = f"C={gk * group_size}-{gk * group_size + group_size - 1}"
-                if gname not in grouped or s > grouped[gname]:
-                    grouped[gname] = s
-            if grouped:
-                self._writer.add_scalars("Best Score / Complexity Group", grouped, global_step=num_samples)
-
-            fig, ax = plt.subplots()
-            ax.scatter(list(best_score_per_c.keys()), list(best_score_per_c.values()))
-            ax.set_xlabel("Complexity")
-            ax.set_ylabel("Best score so far")
-            ax.set_title(f"Pareto front (step {num_samples})")
-            self._writer.add_figure("Score_vs_Complexity", fig, global_step=num_samples)
-            plt.close(fig)
-
-            table_lines = ["|Complexity|Score|Program|", "|---|---|---|"]
-            for c, s in sorted(best_score_per_c.items()):
-                progorder = best_progorder_per_c[c]
-                table_lines.append(f"|{c}|{s:.4g}|{progorder}|")
-            self._writer.add_text("Best Program by Complexity", "\n".join(table_lines), global_step=num_samples)
-
         self._writer.add_scalar("Total Token Cost", tot_token_cost, global_step=num_samples)
 
         self._writer.add_scalars(
@@ -157,18 +116,36 @@ class TensorBoardWriter:
             global_step=num_samples,
         )
 
-        if cur_best_sample_order == num_samples and cur_best_program_str is not None:
-            self._writer.add_text("Best Function String", cur_best_program_str, global_step=num_samples)
+        if num_samples % self._config.log_frequency == 0:
+            # Pareto front scatter+line
+            if pareto_front and len(pareto_front) >= 2:
+                cbins = [p.cbin for p in pareto_front]
+                scores = [p.score for p in pareto_front]
+                fig, ax = plt.subplots()
+                ax.scatter(cbins, scores)
+                ax.plot(cbins, scores, linestyle="--", alpha=0.5)
+                ax.set_xlabel("Complexity Bin")
+                ax.set_ylabel("Score")
+                ax.set_title(f"Pareto Front (step {num_samples})")
+                self._writer.add_figure("Pareto_Front", fig, global_step=num_samples)
+                plt.close(fig)
 
-    def __getstate__(self) -> dict:
-        state = self.__dict__.copy()
-        # Remove non-serializable writer
-        state["_writer"] = None
-        return state
+            # Best score per island
+            if best_score_per_island:
+                self._writer.add_scalars(
+                    "Best Score / Island",
+                    {f"island_{i}": s for i, s in enumerate(best_score_per_island)},
+                    global_step=num_samples,
+                )
 
-    def __setstate__(self, state: dict) -> None:
-        self.__dict__.update(state)
-        self._init_writer()
+            # Island sizes
+            if island_sizes:
+                self._writer.add_scalars(
+                    "Island Size",
+                    {f"island_{i}": n for i, n in enumerate(island_sizes)},
+                    global_step=num_samples,
+                )
+
 
 
 # ---------------------------------------------------------------------------
@@ -176,33 +153,21 @@ class TensorBoardWriter:
 # ---------------------------------------------------------------------------
 
 class Profiler:
-    """Orchestrates experiment profiling: TensorBoard, JSON sample logs, and statistics."""
+    """Orchestrates experiment profiling: TensorBoard and statistics."""
 
     def __init__(
         self,
-        num_islands: int,
         log_dir: str,
-        max_log_nums: int | None = None,
         config: ProfilerConfig | None = None,
     ):
         self._config = config or ProfilerConfig()
         self._log_dir = log_dir
-        self._max_log_nums = max_log_nums
         self._num_samples = 0
 
         self._tb = TensorBoardWriter(log_dir, self._config)
 
-        # Sample logging (inlined from SampleLogger)
-        self._json_dir = os.path.join(log_dir, "samples")
-        os.makedirs(self._json_dir, exist_ok=True)
-
-        # Statistics tracking (inlined from StatisticsTracker)
+        # Statistics tracking
         self._best_score: float = -float("inf")
-        self._best_program_sample_order: int | None = None
-        self._best_program_str: str | None = None
-        self._best_score_per_c: dict[int, float] = {}
-        self._best_progstr_per_c: dict[int, str] = {}
-        self._best_progorder_per_c: dict[int, int] = {}
         self._success_count: int = 0
         self._failed_count: int = 0
         self._tot_sample_time: float = 0.0
@@ -212,55 +177,28 @@ class Profiler:
     def register_function(
         self,
         program: code_manipulation.EvaluatedProgram,
-        pareto_size: int | None = None,
+        *,
+        pareto_front=None,
+        best_score_per_island=None,
+        island_sizes=None,
     ) -> None:
         """Register a newly evaluated program for logging."""
-        if self._max_log_nums is not None and self._num_samples >= self._max_log_nums:
-            return
-
         sample_order: int = program.global_sample_nums
         if sample_order > self._num_samples:
             self._num_samples = sample_order
-        self._log_program(program, pareto_size=pareto_size)
-
-    def _write_sample(self, program: code_manipulation.EvaluatedProgram) -> None:
-        """Write JSON metadata and equation source file for *program*."""
-        sample_order = program.global_sample_nums or 0
-        content = {
-            "sample_order": sample_order,
-            "score": program.score,
-            "optimized_params": program.optimized_params.tolist() if program.optimized_params is not None else None,
-            "complexity": program.complexity,
-            "complexity_detail": program.complexity_detail,
-            "sample_time": program.sample_time,
-            "evaluate_time": program.evaluate_time,
-            "token_usage": program.token_usage,
-            "token_cost": program.token_cost,
-            "function": str(program),
-        }
-        path = os.path.join(self._json_dir, f"samples_{sample_order}.json")
-        with open(path, "w") as f:
-            json.dump(content, f, indent=4)
-
-        function_path = os.path.join(self._json_dir, f"equation_{sample_order}.py")
-        program.save_to_file(function_path)
+        self._log_program(
+            program,
+            pareto_front=pareto_front,
+            best_score_per_island=best_score_per_island,
+            island_sizes=island_sizes,
+        )
 
     def _update_stats(self, program: code_manipulation.EvaluatedProgram) -> None:
         """Update aggregate statistics with a newly evaluated *program*."""
-        sample_order = program.global_sample_nums or 0
         score = program.score
-        complexity = program.complexity
 
         if score is not None and score > self._best_score:
             self._best_score = score
-            self._best_program_sample_order = sample_order
-            self._best_program_str = str(program)
-
-        if complexity is not None:
-            if complexity not in self._best_score_per_c or score > self._best_score_per_c[complexity]:
-                self._best_score_per_c[complexity] = score
-                self._best_progstr_per_c[complexity] = str(program)
-                self._best_progorder_per_c[complexity] = sample_order
 
         if score:
             self._success_count += 1
@@ -276,9 +214,12 @@ class Profiler:
     def _log_program(
         self,
         program: code_manipulation.EvaluatedProgram,
-        pareto_size: int | None = None,
+        *,
+        pareto_front=None,
+        best_score_per_island=None,
+        island_sizes=None,
     ) -> None:
-        """Write JSON, update stats, and write TensorBoard data."""
+        """Update stats and write TensorBoard data."""
         logger.info(
             "Evaluated Function: score=%s complexity=%s sample_order=%s",
             program.score,
@@ -286,48 +227,20 @@ class Profiler:
             program.global_sample_nums,
         )
 
-        self._write_sample(program)
         self._update_stats(program)
 
         self._tb.write(
             num_samples=self._num_samples,
             best_score=self._best_score,
-            best_score_per_c=self._best_score_per_c,
-            best_progorder_per_c=self._best_progorder_per_c,
             tot_token_cost=self._tot_token_cost,
             success_count=self._success_count,
             failed_count=self._failed_count,
             tot_sample_time=self._tot_sample_time,
             tot_evaluate_time=self._tot_evaluate_time,
-            cur_best_sample_order=self._best_program_sample_order,
-            cur_best_program_str=self._best_program_str,
-            pareto_size=pareto_size,
+            pareto_front=pareto_front,
+            best_score_per_island=best_score_per_island,
+            island_sizes=island_sizes,
         )
-
-    def write_best_program_per_c_file(self) -> None:
-        """Writes the best program found for each complexity to a text file."""
-        output_path = os.path.join(self._log_dir, "best_programs_per_complexity.txt")
-        with open(output_path, "w") as f:
-            for c in sorted(self._best_score_per_c.keys()):
-                score = self._best_score_per_c[c]
-                order = self._best_progorder_per_c[c]
-                prog_str = self._best_progstr_per_c[c]
-                f.write(f"{c},{score:.4g},{order}\n{prog_str}\n")
-        logger.info("Best programs per complexity saved to %s", output_path)
-
-    def write_pareto_front(
-        self, pareto_front: list[code_manipulation.EvaluatedProgram],
-    ) -> None:
-        """Write Pareto-optimal programs to a Python file."""
-        output_path = os.path.join(self._log_dir, "pareto_front.py")
-        with open(output_path, "w") as f:
-            f.write("# Pareto-optimal programs (score vs complexity)\n")
-            f.write(f"# Total: {len(pareto_front)} programs\n\n")
-            for prog in pareto_front:
-                f.write(f"# score={prog.score:.6g}  complexity={prog.complexity}\n")
-                f.write(str(prog))
-                f.write("\n\n")
-        logger.info("Pareto front (%d programs) saved to %s", len(pareto_front), output_path)
 
     # ---- Snapshot / restore for SQLite checkpoint ----
 
@@ -335,8 +248,6 @@ class Profiler:
         """Returns a dict of all aggregate counters."""
         return {
             "best_score": self._best_score,
-            "best_program_sample_order": self._best_program_sample_order,
-            "best_program_str": self._best_program_str,
             "success_count": self._success_count,
             "failed_count": self._failed_count,
             "tot_sample_time": self._tot_sample_time,
@@ -344,39 +255,12 @@ class Profiler:
             "tot_token_cost": self._tot_token_cost,
         }
 
-    def get_best_per_complexity_snapshot(self) -> dict[int, tuple[float, str, int]]:
-        """Returns ``{complexity: (score, prog_str, order)}``."""
-        return {
-            c: (self._best_score_per_c[c], self._best_progstr_per_c[c], self._best_progorder_per_c[c])
-            for c in self._best_score_per_c
-        }
-
-    def restore_stats(
-        self,
-        stats: dict,
-        best_per_c: dict[int, tuple[float, str, int]],
-    ) -> None:
+    def restore_stats(self, stats: dict) -> None:
         """Sets all internal counters from loaded data."""
         self._best_score = stats.get("best_score", -float("inf"))
-        self._best_program_sample_order = stats.get("best_program_sample_order")
-        self._best_program_str = stats.get("best_program_str")
         self._success_count = stats.get("success_count", 0)
         self._failed_count = stats.get("failed_count", 0)
         self._tot_sample_time = stats.get("tot_sample_time", 0.0)
         self._tot_evaluate_time = stats.get("tot_evaluate_time", 0.0)
         self._tot_token_cost = stats.get("tot_token_cost", 0.0)
 
-        self._best_score_per_c = {}
-        self._best_progstr_per_c = {}
-        self._best_progorder_per_c = {}
-        for c, (score, prog_str, order) in best_per_c.items():
-            self._best_score_per_c[c] = score
-            self._best_progstr_per_c[c] = prog_str
-            self._best_progorder_per_c[c] = order
-
-    def __getstate__(self) -> dict:
-        state = self.__dict__.copy()
-        return state
-
-    def __setstate__(self, state: dict) -> None:
-        self.__dict__.update(state)

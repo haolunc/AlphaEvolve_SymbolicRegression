@@ -126,20 +126,11 @@ CREATE TABLE IF NOT EXISTS metadata (
 CREATE TABLE IF NOT EXISTS profiler_stats (
     id                        INTEGER PRIMARY KEY CHECK (id = 1),
     best_score                REAL    NOT NULL DEFAULT 0,
-    best_program_sample_order INTEGER,
-    best_program_str          TEXT,
     success_count             INTEGER NOT NULL DEFAULT 0,
     failed_count              INTEGER NOT NULL DEFAULT 0,
     tot_sample_time           REAL    NOT NULL DEFAULT 0.0,
     tot_evaluate_time         REAL    NOT NULL DEFAULT 0.0,
     tot_token_cost            REAL    NOT NULL DEFAULT 0.0
-);
-
-CREATE TABLE IF NOT EXISTS profiler_per_complexity (
-    complexity          INTEGER PRIMARY KEY,
-    best_score          REAL    NOT NULL,
-    best_program_str    TEXT    NOT NULL,
-    best_sample_order   INTEGER NOT NULL
 );
 """
 
@@ -164,6 +155,15 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         )
         conn.commit()
         logger.info("Migration complete: island_programs.score backfilled")
+
+    # Drop legacy profiler_per_complexity table
+    tables = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'",
+    ).fetchall()}
+    if "profiler_per_complexity" in tables:
+        logger.info("Dropping legacy profiler_per_complexity table")
+        conn.execute("DROP TABLE profiler_per_complexity")
+        conn.commit()
 
 
 class CheckpointDB:
@@ -253,7 +253,9 @@ class CheckpointDB:
         score: float,
     ) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO island_programs (island_id, complexity_bin, global_sample_num, score) VALUES (?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO island_programs"
+            " (island_id, complexity_bin, global_sample_num, score)"
+            " VALUES (?, ?, ?, ?)",
             (island_id, complexity_bin, global_sample_num, score),
         )
 
@@ -302,30 +304,18 @@ class CheckpointDB:
         stats = profiler.get_stats_snapshot()
         self._conn.execute(
             """INSERT OR REPLACE INTO profiler_stats (
-                id, best_score, best_program_sample_order, best_program_str,
+                id, best_score,
                 success_count, failed_count, tot_sample_time, tot_evaluate_time,
                 tot_token_cost
-            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (1, ?, ?, ?, ?, ?, ?)""",
             (
                 stats["best_score"] if stats["best_score"] != float("-inf") else None,
-                stats["best_program_sample_order"],
-                stats["best_program_str"],
                 stats["success_count"],
                 stats["failed_count"],
                 stats["tot_sample_time"],
                 stats["tot_evaluate_time"],
                 stats["tot_token_cost"],
             ),
-        )
-
-    def save_profiler_per_complexity(
-        self, complexity: int, score: float, prog_str: str, order: int,
-    ) -> None:
-        self._conn.execute(
-            """INSERT OR REPLACE INTO profiler_per_complexity
-               (complexity, best_score, best_program_str, best_sample_order)
-               VALUES (?, ?, ?, ?)""",
-            (complexity, score, prog_str, order),
         )
 
     # ---- Read operations -------------------------------------------------
@@ -434,7 +424,7 @@ class CheckpointDB:
 
     def load_profiler_stats(self) -> dict | None:
         row = self._conn.execute(
-            """SELECT best_score, best_program_sample_order, best_program_str,
+            """SELECT best_score,
                       success_count, failed_count, tot_sample_time,
                       tot_evaluate_time, tot_token_cost
                FROM profiler_stats WHERE id = 1""",
@@ -443,20 +433,12 @@ class CheckpointDB:
             return None
         return {
             "best_score": row[0] if row[0] is not None else float("-inf"),
-            "best_program_sample_order": row[1],
-            "best_program_str": row[2],
-            "success_count": row[3],
-            "failed_count": row[4],
-            "tot_sample_time": row[5],
-            "tot_evaluate_time": row[6],
-            "tot_token_cost": row[7],
+            "success_count": row[1],
+            "failed_count": row[2],
+            "tot_sample_time": row[3],
+            "tot_evaluate_time": row[4],
+            "tot_token_cost": row[5],
         }
-
-    def load_profiler_per_complexity(self) -> dict[int, tuple[float, str, int]]:
-        rows = self._conn.execute(
-            "SELECT complexity, best_score, best_program_str, best_sample_order FROM profiler_per_complexity",
-        ).fetchall()
-        return {c: (score, prog_str, order) for c, score, prog_str, order in rows}
 
     @property
     def is_populated(self) -> bool:

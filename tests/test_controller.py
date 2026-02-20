@@ -88,12 +88,6 @@ class TestRegisterAndStop:
 
 
 class TestLifecycleCheckpoint:
-    def test_maybe_checkpoint_noop(self, db_lifecycle):
-        """maybe_checkpoint always returns False (persistence is incremental)."""
-        db_lifecycle.register_program(make_eval_result())
-        assert not db_lifecycle.maybe_checkpoint()
-        db_lifecycle.finalize()
-
     def test_checkpoint_db_exists(self, db_lifecycle):
         """checkpoint.db should be created when ckpt_dir is set."""
         db_lifecycle.register_program(make_eval_result())

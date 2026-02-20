@@ -18,9 +18,11 @@
 
 from __future__ import annotations
 
+import bisect
 import dataclasses
 import os
 from collections.abc import Sequence
+from typing import NamedTuple
 
 import numpy as np
 import scipy
@@ -29,9 +31,17 @@ from . import code_manipulation, profiler
 from . import config as config_lib
 from .checkpoint import CheckpointDB
 from .logging_config import get_logger
-from .messages import EvalResult, Prompt, SampleMessage
+from .messages import EvalResult, ExecutionResult, Prompt, SampleMessage
 
 logger = get_logger("database")
+
+
+class ParetoEntry(NamedTuple):
+    """Lightweight Pareto front entry."""
+
+    cbin: int       # complexity // complexity_bin_size
+    score: float
+    gsn: int        # global_sample_num
 
 
 def _get_prompt_mid(new_version: int) -> str:
@@ -103,7 +113,7 @@ class Island:
     def sample_gsns(
         self,
         temperature: float,
-        pareto_front: list[code_manipulation.EvaluatedProgram] | None = None,
+        pareto_front: list[ParetoEntry] | None = None,
     ) -> list[int]:
         """Sample global_sample_nums for prompt generation.
 
@@ -133,20 +143,35 @@ class Island:
     def _pareto_weights(
         self,
         bins: list[int],
-        pareto_front: list[code_manipulation.EvaluatedProgram],
+        pareto_front: list[ParetoEntry],
     ) -> np.ndarray:
         """Compute Pareto-aware bin selection weights."""
-        pareto_complexities = np.array([p.complexity for p in pareto_front], dtype=float)
-        pareto_scores = np.array([p.score for p in pareto_front], dtype=float)
+        pareto_dict = {p.cbin: p.score for p in pareto_front}
+        pareto_cbins = sorted(pareto_dict)
 
         weights = np.ones(len(bins), dtype=float)
         for i, bin_key in enumerate(bins):
-            bin_center = bin_key * self._complexity_bin_size + self._complexity_bin_size / 2.0
-            target = float(np.interp(bin_center, pareto_complexities, pareto_scores))
+            if bin_key in pareto_dict:
+                target_score = pareto_dict[bin_key]
+            elif pareto_cbins:
+                # Find nearest cbin on the Pareto front
+                idx = bisect.bisect_left(pareto_cbins, bin_key)
+                if idx == 0:
+                    nearest = pareto_cbins[0]
+                elif idx == len(pareto_cbins):
+                    nearest = pareto_cbins[-1]
+                else:
+                    lo, hi = pareto_cbins[idx - 1], pareto_cbins[idx]
+                    nearest = lo if (bin_key - lo) <= (hi - bin_key) else hi
+                target_score = pareto_dict[nearest]
+            else:
+                continue  # no Pareto entries, keep weight = 1.0
+
             cluster_best = max(s for _, s in self._bins[bin_key])
-            gap = max(0.0, target - cluster_best)
+            gap = max(0.0, target_score - cluster_best)
             weights[i] = 1.0 + gap
 
+        # normalize
         total = weights.sum()
         if total == 0:
             return np.ones(len(bins)) / len(bins)
@@ -187,14 +212,15 @@ class ProgramsDatabase:
         ]
 
         self._best_score_per_island: list[float] = [-float("inf")] * config.num_islands
-        self._best_program_per_island: list[code_manipulation.EvaluatedProgram | None] = [None] * config.num_islands
+        # (gsn, score, complexity) tuples — lightweight replacement for EvaluatedProgram
+        self._best_program_per_island: list[tuple[int, float, int] | None] = [None] * config.num_islands
 
         self._last_reset_step: int = 1
-        self._profiler = profiler.Profiler(config.num_islands, log_dir, config=profiler_config)
+        self._profiler = profiler.Profiler(log_dir, config=profiler_config)
         self._global_sample_nums = 0
 
-        # Pareto front: programs not dominated by any other in (score, complexity)
-        self._pareto_front: list[code_manipulation.EvaluatedProgram] = []
+        # Pareto front: lightweight entries sorted by cbin
+        self._pareto_front: list[ParetoEntry] = []
 
         # Lifecycle / checkpoint management
         self._ckpt_dir = ckpt_dir
@@ -211,8 +237,8 @@ class ProgramsDatabase:
         return self._global_sample_nums
 
     @property
-    def pareto_front(self) -> list[code_manipulation.EvaluatedProgram]:
-        """Current Pareto-optimal programs (sorted by complexity)."""
+    def pareto_front(self) -> list[ParetoEntry]:
+        """Current Pareto-optimal entries (sorted by cbin)."""
         return list(self._pareto_front)
 
     @property
@@ -308,14 +334,21 @@ class ProgramsDatabase:
             if island_id < len(self._islands):
                 self._islands[island_id]._bins = bins
 
-        # Load pareto front (only the specific programs, not all)
+        # Load pareto front — reconstruct ParetoEntry from stored programs
         pareto_ids = checkpoint_db.load_pareto_front_ids()
         if pareto_ids:
             pareto_programs = checkpoint_db.load_programs_by_ids(pareto_ids)
-            self._pareto_front = sorted(
-                [pareto_programs[gsn] for gsn in pareto_ids if gsn in pareto_programs],
-                key=lambda p: p.complexity,
-            )
+            bin_size = self._config.complexity_bin_size
+            entries = []
+            for gsn in pareto_ids:
+                if gsn in pareto_programs:
+                    p = pareto_programs[gsn]
+                    entries.append(ParetoEntry(
+                        cbin=p.complexity // bin_size,
+                        score=p.score,
+                        gsn=gsn,
+                    ))
+            self._pareto_front = sorted(entries, key=lambda e: e.cbin)
 
         # Load metadata
         meta = checkpoint_db.load_metadata()
@@ -327,32 +360,24 @@ class ProgramsDatabase:
             if i < len(self._best_score_per_island):
                 self._best_score_per_island[i] = s
 
-        best_prog_ids = meta.get("best_program_per_island", [None] * len(self._islands))
-        gsns_to_load = [gsn for gsn in best_prog_ids if gsn is not None]
-        if gsns_to_load:
-            best_programs = checkpoint_db.load_programs_by_ids(gsns_to_load)
-            for i, gsn in enumerate(best_prog_ids):
-                if i < len(self._best_program_per_island) and gsn is not None and gsn in best_programs:
-                    self._best_program_per_island[i] = best_programs[gsn]
+        best_prog_entries = meta.get("best_program_per_island", [None] * len(self._islands))
+        for i, entry in enumerate(best_prog_entries):
+            if i >= len(self._best_program_per_island) or entry is None:
+                continue
+            if isinstance(entry, list) and len(entry) == 3:
+                # New format: [gsn, score, complexity]
+                self._best_program_per_island[i] = tuple(entry)
 
         # Restore profiler
         profiler_stats = checkpoint_db.load_profiler_stats()
-        profiler_per_c = checkpoint_db.load_profiler_per_complexity()
         if profiler_stats is not None:
-            self._profiler.restore_stats(profiler_stats, profiler_per_c)
+            self._profiler.restore_stats(profiler_stats)
             self._profiler._num_samples = self._global_sample_nums
 
-    def maybe_checkpoint(self) -> bool:
-        """No-op: persistence is now incremental via SQLite."""
-        return False
-
     def finalize(self) -> None:
-        """Close the checkpoint DB and write output files."""
+        """Close the checkpoint DB."""
         if self._checkpoint_db:
             self._checkpoint_db.close()
-        self._profiler.write_best_program_per_c_file()
-        if self._pareto_front:
-            self._profiler.write_pareto_front(self._pareto_front)
 
     def get_prompt(self) -> Prompt:
         """Returns a prompt containing implementations from one chosen island."""
@@ -410,24 +435,6 @@ class ProgramsDatabase:
         )
         return prompt
 
-    def _register_program_in_island(
-        self,
-        gsn: int,
-        score: float,
-        complexity: int,
-        island_id: int,
-    ) -> None:
-        """Registers a program entry in the specified island's in-memory index."""
-        self._islands[island_id].register(gsn, score, complexity)
-
-        island = self._islands[island_id]
-        logger.debug(
-            "Island %d: %d clusters, %d total programs",
-            island_id,
-            island.num_clusters,
-            island.num_programs,
-        )
-
     def register_program(
         self,
         eval_result: EvalResult,
@@ -465,55 +472,50 @@ class ProgramsDatabase:
             token_cost=cost,
         )
 
-        db = self._checkpoint_db
-
-        with db.transaction():
-            self._register_and_persist(evaluated, island_id, ex, db, llm_response_text)
+        with self._checkpoint_db.transaction():
+            self._register_and_persist(evaluated, island_id, ex, llm_response_text)
 
     def _register_and_persist(
         self,
         evaluated: code_manipulation.EvaluatedProgram,
         island_id: int | None,
-        ex: object | None,
-        db: CheckpointDB,
+        ex: ExecutionResult | None,
         llm_response_text: str | None,
     ) -> None:
         """Core registration + DB persistence (runs inside a transaction)."""
+        db = self._checkpoint_db
         db.insert_program(evaluated, llm_response_text=llm_response_text)
 
         if ex is not None:
-            gsn = evaluated.global_sample_nums
-            score = evaluated.score
-            complexity = evaluated.complexity
-
-            if island_id is None:
-                for iid in range(len(self._islands)):
-                    self._register_program_in_island(gsn, score, complexity, iid)
-            else:
-                self._register_program_in_island(gsn, score, complexity, island_id)
-
-            # Track best per island
+            gsn, score, complexity = evaluated.global_sample_nums, evaluated.score, evaluated.complexity
             target_ids = range(len(self._islands)) if island_id is None else [island_id]
+
+            for iid in target_ids:
+                self._islands[iid].register(gsn, score, complexity)
+
             for iid in target_ids:
                 if score > self._best_score_per_island[iid]:
                     self._best_score_per_island[iid] = score
-                    self._best_program_per_island[iid] = evaluated
+                    self._best_program_per_island[iid] = (gsn, score, complexity)
                     logger.info("Best score of island %d increased to %s", iid, score)
 
-        self._update_pareto_front(evaluated)
-        self._profiler.register_function(evaluated, pareto_size=len(self._pareto_front))
+            self._update_pareto_front(evaluated)
+
+        self._profiler.register_function(
+            evaluated,
+            pareto_front=self._pareto_front,
+            best_score_per_island=self._best_score_per_island,
+            island_sizes=[isl.num_programs for isl in self._islands],
+        )
 
         # Periodic checkpoint of island index
         self._steps_since_checkpoint += 1
         if self._steps_since_checkpoint >= self._config.checkpoint_interval:
-            self._checkpoint_island_index()
+            db.checkpoint_island_index(self._islands, self._config.num_islands)
+            self._steps_since_checkpoint = 0
 
-        db.replace_pareto_front([p.global_sample_nums for p in self._pareto_front])
+        db.replace_pareto_front([p.gsn for p in self._pareto_front])
         db.save_profiler_stats(self._profiler)
-        per_c = self._profiler.get_best_per_complexity_snapshot()
-        if evaluated.complexity is not None and evaluated.complexity in per_c:
-            score_val, prog_str, order = per_c[evaluated.complexity]
-            db.save_profiler_per_complexity(evaluated.complexity, score_val, prog_str, order)
         db.save_metadata("global_sample_nums", self._global_sample_nums)
         db.save_metadata("last_reset_step", self._last_reset_step)
         db.save_metadata(
@@ -521,45 +523,39 @@ class ProgramsDatabase:
         )
         db.save_metadata(
             "best_program_per_island",
-            [p.global_sample_nums if p else None for p in self._best_program_per_island],
+            [list(t) if t else None for t in self._best_program_per_island],
         )
 
         if self._global_sample_nums - self._last_reset_step > self._config.reset_period:
             self._last_reset_step = self._global_sample_nums
             self.reset_islands()
 
-    def _checkpoint_island_index(self) -> None:
-        """Persist current in-memory island index to DB."""
-        self._checkpoint_db.checkpoint_island_index(
-            self._islands, self._config.num_islands,
-        )
-        self._steps_since_checkpoint = 0
-
     def _update_pareto_front(self, program: code_manipulation.EvaluatedProgram) -> None:
         """Update the Pareto front with *program* if it is non-dominated.
 
-        A program is *dominated* if another program exists with equal-or-lower
-        complexity and equal-or-higher score (and strictly better in at least
-        one dimension).  The front is kept sorted by complexity.
+        A program is *dominated* if another entry exists with equal-or-lower
+        cbin and equal-or-higher score (and strictly better in at least one
+        dimension).  The front is kept sorted by cbin.
         """
         if program.score is None or program.complexity is None:
             return
 
         score = program.score
-        complexity = program.complexity
+        cbin = program.complexity // self._config.complexity_bin_size
+        gsn = program.global_sample_nums
 
         # Check if dominated by any existing front member
         for fp in self._pareto_front:
-            if fp.complexity <= complexity and fp.score >= score:
+            if fp.cbin <= cbin and fp.score >= score:
                 return  # dominated
 
-        # Not dominated -- add and remove any programs it dominates
+        # Not dominated -- add and remove any entries it dominates
         self._pareto_front = [
             fp for fp in self._pareto_front
-            if not (complexity <= fp.complexity and score >= fp.score)
+            if not (cbin <= fp.cbin and score >= fp.score)
         ]
-        self._pareto_front.append(program)
-        self._pareto_front.sort(key=lambda p: p.complexity)
+        self._pareto_front.append(ParetoEntry(cbin=cbin, score=score, gsn=gsn))
+        self._pareto_front.sort(key=lambda p: p.cbin)
 
     def reset_islands(self) -> None:
         """Resets the weaker half of islands."""
@@ -573,12 +569,14 @@ class ProgramsDatabase:
             self._islands[island_id].clear()
             founder_island_id = np.random.choice(keep_islands_ids)
             founder = self._best_program_per_island[founder_island_id]
-            self._islands[island_id].register(
-                founder.global_sample_nums, founder.score, founder.complexity,
-            )
+            # founder is (gsn, score, complexity)
+            self._islands[island_id].register(founder[0], founder[1], founder[2])
             # Update cached best
-            self._best_score_per_island[island_id] = founder.score
+            self._best_score_per_island[island_id] = founder[1]
             self._best_program_per_island[island_id] = founder
-            logger.info("Reset island %d with founder %d", island_id, founder.global_sample_nums)
+            logger.info("Reset island %d with founder %d", island_id, founder[0])
         # Force checkpoint after reset
-        self._checkpoint_island_index()
+        self._checkpoint_db.checkpoint_island_index(
+            self._islands, self._config.num_islands,
+        )
+        self._steps_since_checkpoint = 0

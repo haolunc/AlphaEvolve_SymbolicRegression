@@ -43,7 +43,6 @@ class TestCheckpointDB:
         assert "pareto_front" in tables
         assert "metadata" in tables
         assert "profiler_stats" in tables
-        assert "profiler_per_complexity" in tables
 
     def test_memory_db(self):
         """CheckpointDB supports :memory: path without errors."""

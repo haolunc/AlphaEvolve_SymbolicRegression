@@ -19,9 +19,12 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 from dataclasses import field
 
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,11 +97,9 @@ class ProfilerConfig:
 
     Attributes:
       log_frequency: How often (in samples) to write detailed TensorBoard logs.
-      complexity_group_size: Size of complexity groups for TensorBoard scalars.
     """
 
     log_frequency: int = 100
-    complexity_group_size: int = 5
 
 
 @dataclasses.dataclass(frozen=True)
@@ -197,6 +198,12 @@ class RunConfig:
             WorkerConfig: worker_data,
         }
         for dc_cls, dc_data in sub_configs.items():
+            # Filter unknown keys in nested configs (graceful for old YAML files)
+            known = {f.name for f in dataclasses.fields(dc_cls)}
+            unknown = set(dc_data.keys()) - known
+            for k in unknown:
+                logger.warning("Ignoring unknown %s key: %s", dc_cls.__name__, k)
+                del dc_data[k]
             _coerce_int_fields(dc_cls, dc_data)
         _coerce_int_fields(cls, data)
 

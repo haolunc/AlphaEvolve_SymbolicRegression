@@ -202,7 +202,6 @@ def main_single(
                 except Exception:
                     logger.warning("Error analysing sample: %s", getattr(sample_info, "response_text", "unknown"))
 
-            database.maybe_checkpoint()
             if database.should_stop:
                 break
     finally:

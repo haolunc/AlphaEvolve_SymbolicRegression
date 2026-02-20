@@ -114,8 +114,6 @@ def database_worker(
             except Exception as e:
                 wlog.error("Database worker error: %s", e)
 
-            database.maybe_checkpoint()
-
             # Periodic performance report
             start_time = _maybe_report_perf(
                 start_time, wc.perf_report_interval_seconds, perf_queue,

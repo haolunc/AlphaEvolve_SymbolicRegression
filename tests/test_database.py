@@ -4,7 +4,7 @@ import pytest
 
 from alpha_evolve_sr.code_manipulation import EvaluatedProgram, ParsedFunction
 from alpha_evolve_sr.config import ProgramsDatabaseConfig
-from alpha_evolve_sr.database import Island
+from alpha_evolve_sr.database import Island, ParetoEntry
 from alpha_evolve_sr.messages import EvalResult, ExecutionResult, LLMResponse, SampleMessage
 from tests.conftest import SAMPLE_PROMPT, SAMPLE_SEED_FUNCTION
 
@@ -85,12 +85,9 @@ class TestProgramsDatabase:
         # Should not raise and sample count should be correct
         assert db.sample_count > db._config.reset_period
 
-    def test_finalize_writes_file(self, db):
-        """finalize() writes the best-program-per-complexity file."""
+    def test_finalize_no_error(self, db):
+        """finalize() completes without raising."""
         db.finalize()
-        import os
-        output_path = os.path.join(db._profiler._log_dir, "best_programs_per_complexity.txt")
-        assert os.path.exists(output_path)
 
 
 class TestClusterPruning:
@@ -147,12 +144,12 @@ class TestParetoFront:
         assert len(db.pareto_front) == 1
         assert db.pareto_front[0].score == -0.5
 
-    def test_front_sorted_by_complexity(self, db):
+    def test_front_sorted_by_cbin(self, db):
         func = ParsedFunction(name="equation", args="x, params", body="    return x")
         for c, s in [(20, -0.5), (3, -2.0), (10, -0.8)]:
             db.register_program(*_make_result(func, island_id=0, score=s, complexity=c))
-        complexities = [p.complexity for p in db.pareto_front]
-        assert complexities == sorted(complexities)
+        cbins = [p.cbin for p in db.pareto_front]
+        assert cbins == sorted(cbins)
 
     def test_pareto_aware_get_prompt(self, tmp_path):
         """get_prompt works with pareto_aware=True."""
@@ -173,12 +170,39 @@ class TestParetoFront:
         prompt = database.get_prompt()
         assert len(prompt.code) > 0
 
-    def test_finalize_writes_pareto_file(self, db, tmp_path):
-        """finalize() writes pareto_front.py when front is non-empty."""
-        import os
-        db.finalize()
-        pareto_path = os.path.join(db._profiler._log_dir, "pareto_front.py")
-        assert os.path.exists(pareto_path)
+class TestParetoWeights:
+    """Tests for Island._pareto_weights() with non-front bins."""
+
+    def test_non_front_bin_uses_nearest_pareto_entry(self):
+        """A bin not on the Pareto front gets a weight based on the nearest Pareto cbin."""
+        island = Island(functions_per_prompt=2, complexity_bin_size=1, cluster_max_size=10)
+
+        # Register bins at cbin=2, 5, 10 with known scores
+        island.register(gsn=1, score=0.5, complexity=2)   # cbin=2
+        island.register(gsn=2, score=0.3, complexity=5)   # cbin=5
+        island.register(gsn=3, score=0.8, complexity=10)  # cbin=10
+
+        # Pareto front only has entries at cbin=2 and cbin=10
+        pareto_front = [
+            ParetoEntry(cbin=2, score=0.9, gsn=100),
+            ParetoEntry(cbin=10, score=1.0, gsn=101),
+        ]
+
+        bins = list(island._bins.keys())
+        weights = island._pareto_weights(bins, pareto_front)
+
+        # cbin=5 is not on the Pareto front; nearest is cbin=2 (distance 3) vs cbin=10 (distance 5)
+        # So target_score for cbin=5 = pareto score at cbin=2 = 0.9
+        # gap = max(0, 0.9 - 0.3) = 0.6, weight = 1.0 + 0.6 = 1.6
+        idx_5 = bins.index(5)
+        # The raw weight for cbin=5 should be 1.6 (before normalization)
+        # Just verify it's greater than the base weight (1.0 normalized)
+        assert weights[idx_5] > 1.0 / len(bins), (
+            f"cbin=5 weight {weights[idx_5]} should be above uniform {1.0 / len(bins)}"
+        )
+
+        # Also verify all weights sum to 1.0
+        assert abs(weights.sum() - 1.0) < 1e-9
 
 
 class TestIslandProperties:

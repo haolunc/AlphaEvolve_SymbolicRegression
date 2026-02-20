@@ -57,7 +57,6 @@ evaluator:
 # =====================================================================
 profiler:
   log_frequency: 100
-  complexity_group_size: 5
 
 # =====================================================================
 # Worker performance reporting
