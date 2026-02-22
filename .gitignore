@@ -13,4 +13,5 @@ logger/
 .eggs/
 .env
 scratch/
-docs/
+docs_ref/
+docs/_build/

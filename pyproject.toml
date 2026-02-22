@@ -31,6 +31,12 @@ dev = [
     "mypy",
     "cma",
 ]
+docs = [
+    "sphinx",
+    "sphinx-rtd-theme",
+    "myst-parser",
+    "sphinxcontrib-mermaid",
+]
 
 [project.scripts]
 alpha-evolve-sr = "alpha_evolve_sr.cli:main"
