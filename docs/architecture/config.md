@@ -1,38 +1,71 @@
 # Configuration Reference
 
-All configuration is loaded from a single YAML file via `RunConfig.from_yaml()`.
+```{contents}
+:local:
+:depth: 2
+```
+
+---
+
+## How Config is Loaded
+
+All configuration lives in a single YAML file, parsed by `RunConfig.from_yaml()`:
+
+```python
+run_config = RunConfig.from_yaml("my_config.yaml")
+```
+
+The YAML file has top-level scalar fields plus nested sections (`sampler`, `database`, `evaluator`, `profiler`, `worker`) that map to frozen dataclasses. Unknown keys in nested sections are warned and ignored; unknown top-level keys raise `ValueError`.
 
 > **Note:** `RunConfig` is the only mutable config dataclass. The CLI
 > sets `log_path` and `save_ckpt_dir` after construction, and may
 > override `resume_from_ckpt` from command-line arguments.
 
-<details>
-<summary><strong>RunConfig</strong> — top-level pipeline configuration</summary>
+---
+
+## Full Example
+
+```{literalinclude} ../../examples/my_config.yaml
+:language: yaml
+```
+
+---
+
+## Dataclass Reference
+
+### RunConfig
+
+Top-level pipeline configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `problem_dir` | `str \| None` | `None` | Path to the problem specification directory |
-| `data_folder` | `str \| None` | `None` | Path to the training data directory |
+| `problem_dir` | `str \| None` | `None` | Path to the problem directory (prompt.txt, equation.py, evaluate.py) |
+| `data_folder` | `str \| None` | `None` | Path to the training data directory (train.csv) |
 | `log_folder` | `str \| None` | `None` | Base name for the log directory |
-| `log_path` | `str \| None` | `None` | Full path to the log directory (derived from `log_folder`) |
+| `log_path` | `str \| None` | `None` | Full path to log directory (derived from `log_folder` by CLI) |
 | `problem_name` | `str` | `"oscillator1"` | Human-readable problem identifier |
 | `max_samples` | `int` | `3600` | Stop after this many total evaluations |
-| `distributed` | `bool` | `True` | Whether to use multiprocessing |
+| `distributed` | `bool` | `True` | Use multiprocessing (distributed mode) |
 | `num_samplers` | `int` | `8` | Number of sampler worker processes |
 | `num_evaluators` | `int` | `8` | Number of evaluator worker processes |
-| `save_ckpt_dir` | `str \| None` | `None` | Directory for checkpoint files (derived from `log_folder`) |
-| `save_ckpt_interval` | `int` | `300` | Checkpoint interval in seconds |
+| `save_ckpt_dir` | `str \| None` | `None` | Directory for checkpoints (derived from `log_folder` by CLI) |
 | `resume_from_ckpt` | `str \| None` | `None` | Path to a checkpoint directory to resume from |
-| `sampler` | `SamplerConfig` | (defaults) | Nested sampler configuration |
-| `database` | `ProgramsDatabaseConfig` | (defaults) | Nested database configuration |
-| `evaluator` | `EvaluatorConfig` | (defaults) | Nested evaluator configuration |
-| `profiler` | `ProfilerConfig` | (defaults) | Nested profiler configuration |
-| `worker` | `WorkerConfig` | (defaults) | Nested worker configuration |
 
-</details>
+Nested configs (each described below):
 
-<details>
-<summary><strong>ProgramsDatabaseConfig</strong> — evolutionary algorithm parameters</summary>
+| Field | Type |
+|-------|------|
+| `sampler` | `SamplerConfig` |
+| `database` | `ProgramsDatabaseConfig` |
+| `evaluator` | `EvaluatorConfig` |
+| `profiler` | `ProfilerConfig` |
+| `worker` | `WorkerConfig` |
+
+---
+
+### ProgramsDatabaseConfig
+
+Evolutionary algorithm parameters.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -44,11 +77,13 @@ All configuration is loaded from a single YAML file via `RunConfig.from_yaml()`.
 | `complexity_bin_size` | `int` | `10` | Width of each complexity bin |
 | `cluster_max_size` | `int` | `100` | Maximum programs per cluster before pruning |
 | `pareto_aware` | `bool` | `False` | Weight cluster selection by Pareto improvement potential |
+| `checkpoint_interval` | `int` | `10` | Save checkpoint every N registered programs |
 
-</details>
+---
 
-<details>
-<summary><strong>SamplerConfig</strong> — LLM request parameters</summary>
+### SamplerConfig
+
+LLM request parameters.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -61,33 +96,33 @@ All configuration is loaded from a single YAML file via `RunConfig.from_yaml()`.
 | `samples_per_prompt` | `int` | `1` | Number of completions to draw per prompt |
 | `cost_per_ktoken` | `list[float]` | `[0.006, 0.024]` | Cost per 1K tokens `[input, output]` for tracking |
 
-</details>
+---
 
-<details>
-<summary><strong>EvaluatorConfig</strong> — sandbox execution parameters</summary>
+### EvaluatorConfig
+
+Sandbox execution parameters.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `timeout_seconds` | `int` | `400` | Maximum time (seconds) for a single sandbox evaluation |
 
-</details>
+---
 
-<details>
-<summary><strong>ProfilerConfig</strong> — logging and metrics parameters</summary>
+### ProfilerConfig
+
+Logging and metrics parameters.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `log_frequency` | `int` | `100` | Write detailed TensorBoard logs every N samples |
-| `complexity_group_size` | `int` | `5` | Width of complexity groups for TensorBoard scalars |
 
-</details>
+---
 
-<details>
-<summary><strong>WorkerConfig</strong> — distributed worker timing</summary>
+### WorkerConfig
+
+Distributed worker timing.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `perf_report_interval_seconds` | `int` | `150` | How often workers report performance stats |
 | `monitor_interval_seconds` | `int` | `300` | How often the monitor prints a summary report |
-
-</details>

@@ -51,3 +51,10 @@ tests/                     # pytest tests
 - Keep text concise — avoid long paragraphs; prefer bullet points and short sentences
 - Use visual aids liberally: Mermaid diagrams (flowcharts, sequence diagrams, class diagrams), tables, or math formulas (LaTeX `$...$`) where they clarify better than prose
 - Add a **Table of Contents** at the top if a document has more than 3 sections
+
+### Documentation Principles
+
+- **First-principles narrative** — lead with *why* before *what*; don't just list features
+- **Diagrams first** — show the picture, then explain it
+- **Dataclasses as documentation** — config and message dataclasses define contracts; reference them directly
+- **Stay focused** — include only what serves understanding; omit trivia

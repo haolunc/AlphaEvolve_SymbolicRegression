@@ -11,8 +11,10 @@ Inspired by [FunSearch](https://www.nature.com/articles/s41586-023-06924-6) (Nat
 
 introduction
 getting-started
-architecture/design-principles
 architecture/data-flow
-reference/config
-reference/problem-spec
+architecture/input-files
+architecture/config
+architecture/evaluator
+architecture/sampler
+architecture/messages
 ```
