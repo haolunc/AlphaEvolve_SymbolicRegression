@@ -9,7 +9,7 @@ import time
 
 import pandas as pd
 
-from . import checkpoint, code_manipulation
+from . import code_manipulation
 from . import evaluator as evaluator_mod
 from . import sampler as sampler_mod
 from .config import RunConfig
@@ -169,11 +169,11 @@ def main_single(
         initial_result = evaluators.initialize()
 
     database = ProgramsDatabase.restore_or_create(
-        run_config.database, prompt_text, run_config.log_path,
-        profiler_config=run_config.profiler,
+        run_config.database, prompt_text, run_config.log_dir,
         ckpt_dir=run_config.save_ckpt_dir,
         max_samples=run_config.max_samples,
         resume_path=run_config.resume_from_ckpt, initial_result=initial_result,
+        run_config=run_config,
     )
 
     llm = sampler_mod.LLM(config=run_config.sampler)
@@ -217,38 +217,15 @@ def main() -> None:
     """Parse arguments and run the pipeline."""
     parser = argparse.ArgumentParser(description="AlphaEvolve Symbolic Regression")
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
-    parser.add_argument(
-        "--resume_from_ckpt", type=str, default=None, help="Path to checkpoint directory to resume from",
-    )
     args = parser.parse_args()
 
     configure_logging()
 
     run_config = RunConfig.from_yaml(args.config)
-
-    # CLI override for resume
-    if args.resume_from_ckpt:
-        run_config.resume_from_ckpt = args.resume_from_ckpt
-
     run_config.validate()
 
     if run_config.resume_from_ckpt:
         logger.info("Resuming from checkpoint: %s", run_config.resume_from_ckpt)
-        run_config = checkpoint.load_config(run_config.resume_from_ckpt)
-        # Re-apply the CLI override after loading saved config
-        if args.resume_from_ckpt:
-            run_config.resume_from_ckpt = args.resume_from_ckpt
-
-    # Derive log_path and save_ckpt_dir from log_folder if not set
-    if run_config.log_path is None and run_config.log_folder:
-        run_config.log_path = "./log/" + run_config.log_folder
-
-    if run_config.save_ckpt_dir is None and run_config.log_folder:
-        run_config.save_ckpt_dir = "./log/" + run_config.log_folder + "/checkpoints"
-
-    if run_config.save_ckpt_dir:
-        logger.info("Saving config to %s", run_config.save_ckpt_dir)
-        checkpoint.save_config(run_config, run_config.save_ckpt_dir)
 
     mp.set_start_method("spawn")
 

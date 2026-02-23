@@ -23,6 +23,7 @@ import logging
 from dataclasses import field
 
 import yaml
+import os
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ class ProgramsDatabaseConfig:
     cluster_max_size: int = 100
     pareto_aware: bool = False
     checkpoint_interval: int = 10
+    log_frequency: int = 25
 
 
 @dataclasses.dataclass(frozen=True)
@@ -89,17 +91,6 @@ class EvaluatorConfig:
     """
 
     timeout_seconds: int = 400
-
-
-@dataclasses.dataclass(frozen=True)
-class ProfilerConfig:
-    """Configuration for experiment profiling.
-
-    Attributes:
-      log_frequency: How often (in samples) to write detailed TensorBoard logs.
-    """
-
-    log_frequency: int = 100
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,9 +133,7 @@ class RunConfig:
     # Paths
     problem_dir: str | None = None
     data_folder: str | None = None
-    log_folder: str | None = None
-    log_path: str | None = None
-    problem_name: str = "oscillator1"
+    log_dir: str | None = None
 
     # Pipeline
     max_samples: int = 3600
@@ -160,8 +149,16 @@ class RunConfig:
     sampler: SamplerConfig = field(default_factory=SamplerConfig)
     database: ProgramsDatabaseConfig = field(default_factory=ProgramsDatabaseConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
-    profiler: ProfilerConfig = field(default_factory=ProfilerConfig)
     worker: WorkerConfig = field(default_factory=WorkerConfig)
+
+    def __post_init__(self) -> None:
+        # Normalize resume_from_ckpt: directory → checkpoint.db
+        if self.resume_from_ckpt is not None and os.path.isdir(self.resume_from_ckpt):
+            self.resume_from_ckpt = os.path.join(self.resume_from_ckpt, "checkpoint.db")
+
+        # Default save_ckpt_dir to log_dir
+        if self.save_ckpt_dir is None and self.log_dir:
+            self.save_ckpt_dir = self.log_dir
 
     # ------------------------------------------------------------------
     # Serialization
@@ -172,11 +169,21 @@ class RunConfig:
         """Load a RunConfig from a YAML file."""
         with open(path, encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
+        return cls._from_dict(data)
 
-        sampler_data = data.pop("sampler", {})
+    @classmethod
+    def from_yaml_text(cls, yaml_text: str) -> RunConfig:
+        """Load a RunConfig from a YAML string."""
+        data = yaml.safe_load(yaml_text) or {}
+        return cls._from_dict(data)
+
+    @classmethod
+    def _from_dict(cls, data: dict) -> RunConfig:
+        """Shared parsing logic for :meth:`from_yaml` and :meth:`from_yaml_text`."""
+
         database_data = data.pop("database", {})
+        sampler_data = data.pop("sampler", {})
         evaluator_data = data.pop("evaluator", {})
-        profiler_data = data.pop("profiler", {})
         worker_data = data.pop("worker", {})
 
         # Reject unknown top-level keys (catches typos like "smpler")
@@ -188,20 +195,17 @@ class RunConfig:
                 f"Valid top-level keys: {sorted(known_fields)}"
             )
 
-        # Coerce float→int where the dataclass expects int (YAML parses
-        # "10." as 10.0 instead of 10).
         sub_configs = {
             SamplerConfig: sampler_data,
             ProgramsDatabaseConfig: database_data,
             EvaluatorConfig: evaluator_data,
-            ProfilerConfig: profiler_data,
             WorkerConfig: worker_data,
         }
         for dc_cls, dc_data in sub_configs.items():
             # Filter unknown keys in nested configs (graceful for old YAML files)
             known = {f.name for f in dataclasses.fields(dc_cls)}
-            unknown = set(dc_data.keys()) - known
-            for k in unknown:
+            unknown_nested = set(dc_data.keys()) - known
+            for k in unknown_nested:
                 logger.warning("Ignoring unknown %s key: %s", dc_cls.__name__, k)
                 del dc_data[k]
             _coerce_int_fields(dc_cls, dc_data)
@@ -211,14 +215,12 @@ class RunConfig:
             sampler=SamplerConfig(**sampler_data),
             database=ProgramsDatabaseConfig(**database_data),
             evaluator=EvaluatorConfig(**evaluator_data),
-            profiler=ProfilerConfig(**profiler_data),
             worker=WorkerConfig(**worker_data),
             **data,
         )
 
     def to_yaml(self, path: str) -> None:
         """Serialise this config to a YAML file."""
-        import os
 
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         data = dataclasses.asdict(self)
@@ -227,14 +229,13 @@ class RunConfig:
 
     def validate(self) -> None:
         """Raise :class:`ValueError` on invalid configuration values."""
-        import os
 
         if not self.problem_dir:
             raise ValueError("Error: problem_dir is required")
         if not self.data_folder:
             raise ValueError("Error: data_folder is required")
-        if not self.log_folder:
-            raise ValueError("Error: log_folder is required")
+        if not self.log_dir:
+            raise ValueError("Error: log_dir is required")
         if not os.path.isdir(self.problem_dir):
             raise ValueError(f"Error: problem_dir does not exist: {self.problem_dir}")
         for fname in ("prompt.txt", "evaluate.py", "equation.py"):
@@ -249,3 +250,9 @@ class RunConfig:
             raise ValueError(f"Error: num_samplers must be a positive integer, got {self.num_samplers}")
         if not isinstance(self.num_evaluators, int) or self.num_evaluators < 0:
             raise ValueError(f"Error: num_evaluators must be a positive integer, got {self.num_evaluators}")
+
+        if self.resume_from_ckpt is not None:
+            if not os.path.isfile(self.resume_from_ckpt):
+                raise ValueError(
+                    f"Error: checkpoint not found: {self.resume_from_ckpt}"
+                )

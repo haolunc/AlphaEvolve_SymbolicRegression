@@ -75,11 +75,11 @@ def database_worker(
         wlog.info("Initial program registered")
 
     database = ProgramsDatabase.restore_or_create(
-        run_config.database, prompt_text, run_config.log_path,
-        profiler_config=run_config.profiler,
+        run_config.database, prompt_text, run_config.log_dir,
         ckpt_dir=run_config.save_ckpt_dir,
         max_samples=run_config.max_samples,
         resume_path=run_config.resume_from_ckpt, initial_result=initial_result,
+        run_config=run_config,
     )
 
     prompts_generated = 0
@@ -304,7 +304,7 @@ def monitoring_worker(
 ) -> None:
     """Worker function for monitoring process performance."""
     wc = run_config.worker
-    log_dir = run_config.log_path or "./logger"
+    log_dir = run_config.log_dir or "./logger"
     wlog = setup_file_logger("monitor", log_dir)
     wlog.info("Monitoring worker started (PID: %d)", os.getpid())
 

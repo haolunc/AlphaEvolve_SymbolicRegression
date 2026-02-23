@@ -1,24 +1,23 @@
 # =====================================================================
-# Required — fill these in before running
+# Required
 # =====================================================================
 problem_dir:         # Path to problem directory (e.g. specs/dft_xc/)
-data_folder:       # Path to data folder containing train.csv
-log_folder:         # Name for this experiment's log directory
+data_folder:         # Path to data folder containing train.csv
+log_dir:             # Path for logs and checkpoint (e.g. ./log/my_experiment/)
 
 # =====================================================================
 # Pipeline
 # =====================================================================
-problem_name: oscillator1
 max_samples: 3600
 distributed: true
 num_samplers: 2
 num_evaluators: 2
 
 # =====================================================================
-# Checkpointing (saves are incremental via SQLite — no interval needed)
+# Checkpointing
 # =====================================================================
-# save_ckpt_dir:     # Auto-derived from log_folder if omitted
-# resume_from_ckpt:  # Set to checkpoint dir path to resume
+# save_ckpt_dir:     # Defaults to log_dir if omitted
+# resume_from_ckpt:   # Path to checkpoint.db or its parent directory
 
 # =====================================================================
 # LLM sampler
@@ -45,18 +44,14 @@ database:
   complexity_bin_size: 10
   cluster_max_size: 100
   pareto_aware: false
+  checkpoint_interval: 10
+  log_frequency: 25           # TensorBoard logging interval (samples)
 
 # =====================================================================
 # Evaluator
 # =====================================================================
 evaluator:
   timeout_seconds: 400
-
-# =====================================================================
-# Profiler (TensorBoard logging)
-# =====================================================================
-profiler:
-  log_frequency: 100
 
 # =====================================================================
 # Worker performance reporting

@@ -20,10 +20,20 @@ class TestCheckpointError:
         with pytest.raises(CheckpointError, match="Failed to open"):
             CheckpointDB("/nonexistent/deeply/nested/test.db")
 
-    def test_missing_config(self, tmp_path):
-        from alpha_evolve_sr.checkpoint import load_config
-        with pytest.raises(CheckpointError, match="No run_config.yaml"):
-            load_config(str(tmp_path))
+    def test_config_mismatch_on_resume(self, tmp_path):
+        from alpha_evolve_sr.checkpoint import CheckpointDB
+        from alpha_evolve_sr.config import ProgramsDatabaseConfig, RunConfig
+
+        db = CheckpointDB(str(tmp_path / "test.db"))
+        run_config = RunConfig(
+            problem_dir="specs/test", data_folder="data/test", log_dir="test",
+            database=ProgramsDatabaseConfig(num_islands=5),
+        )
+        with db.transaction():
+            db.save_run_config(run_config, num_islands=5, complexity_bin_size=10)
+        with pytest.raises(CheckpointError, match="num_islands"):
+            db.validate_config(num_islands=8, complexity_bin_size=10)
+        db.close()
 
 
 class TestLLMProviderError:

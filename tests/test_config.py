@@ -4,9 +4,10 @@ import dataclasses
 import json
 import os
 
+import pytest
+
 from alpha_evolve_sr.config import (
     EvaluatorConfig,
-    ProfilerConfig,
     ProgramsDatabaseConfig,
     RunConfig,
     SamplerConfig,
@@ -49,8 +50,8 @@ class TestRunConfig:
         assert isinstance(config.sampler, SamplerConfig)
         assert isinstance(config.database, ProgramsDatabaseConfig)
         assert isinstance(config.evaluator, EvaluatorConfig)
-        assert isinstance(config.profiler, ProfilerConfig)
         assert isinstance(config.worker, WorkerConfig)
+        assert config.database.log_frequency == 100
 
     def test_from_yaml(self, tmp_path):
         yaml_content = """\
@@ -121,17 +122,16 @@ sampler:
         assert config.sampler.cost_per_ktoken == [0.01, 0.05]
 
     def test_from_yaml_with_all_nested_configs(self, tmp_path):
-        """All five nested config sections should be parsed from YAML."""
+        """All four nested config sections should be parsed from YAML."""
         yaml_content = """\
 problem_dir: test_dir
 sampler:
   provider: openai
 database:
   num_islands: 5
+  log_frequency: 50
 evaluator:
   timeout_seconds: 200
-profiler:
-  log_frequency: 50
 worker:
   perf_report_interval_seconds: 60
   monitor_interval_seconds: 120
@@ -143,8 +143,8 @@ worker:
         config = RunConfig.from_yaml(yaml_path)
         assert config.sampler.provider == "openai"
         assert config.database.num_islands == 5
+        assert config.database.log_frequency == 50
         assert config.evaluator.timeout_seconds == 200
-        assert config.profiler.log_frequency == 50
         assert config.worker.perf_report_interval_seconds == 60
         assert config.worker.monitor_interval_seconds == 120
 
@@ -171,16 +171,15 @@ smpler:
             problem_dir="specs/test",
             max_samples=50,
             sampler=SamplerConfig(provider="gemini", temperature=0.8),
-            database=ProgramsDatabaseConfig(num_islands=3),
+            database=ProgramsDatabaseConfig(num_islands=3, log_frequency=50),
             evaluator=EvaluatorConfig(timeout_seconds=200),
-            profiler=ProfilerConfig(log_frequency=50),
             worker=WorkerConfig(perf_report_interval_seconds=60),
         )
         yaml_path = str(tmp_path / "out.yaml")
         original.to_yaml(yaml_path)
         loaded = RunConfig.from_yaml(yaml_path)
         assert loaded.evaluator.timeout_seconds == 200
-        assert loaded.profiler.log_frequency == 50
+        assert loaded.database.log_frequency == 50
         assert loaded.worker.perf_report_interval_seconds == 60
 
     def test_validate_passes_for_valid(self, tmp_path):
@@ -193,12 +192,12 @@ smpler:
         data = tmp_path / "data"
         data.mkdir()
 
-        config = RunConfig(problem_dir=str(problem), data_folder=str(data), log_folder="test_logs")
+        config = RunConfig(problem_dir=str(problem), data_folder=str(data), log_dir="test_logs")
         config.validate()  # should not raise
 
     def test_validate_missing_problem_dir(self):
         """validate() should error when problem_dir is missing."""
-        config = RunConfig(data_folder="/tmp", log_folder="logs")
+        config = RunConfig(data_folder="/tmp", log_dir="logs")
         try:
             config.validate()
             assert False, "Should have raised ValueError"
@@ -212,15 +211,15 @@ smpler:
         (problem / "prompt.txt").write_text("test")
         (problem / "evaluate.py").write_text("def evaluate(data): pass")
         (problem / "equation.py").write_text("def equation(x, params): return x")
-        config = RunConfig(problem_dir=str(problem), log_folder="logs")
+        config = RunConfig(problem_dir=str(problem), log_dir="logs")
         try:
             config.validate()
             assert False, "Should have raised ValueError"
         except ValueError as e:
             assert "data_folder" in str(e)
 
-    def test_validate_missing_log_folder(self, tmp_path):
-        """validate() should error when log_folder is missing."""
+    def test_validate_missing_log_dir(self, tmp_path):
+        """validate() should error when log_dir is missing."""
         problem = tmp_path / "problem"
         problem.mkdir()
         (problem / "prompt.txt").write_text("test")
@@ -233,10 +232,10 @@ smpler:
             config.validate()
             assert False, "Should have raised ValueError"
         except ValueError as e:
-            assert "log_folder" in str(e)
+            assert "log_dir" in str(e)
 
     def test_validate_bad_problem_dir(self, tmp_path):
-        config = RunConfig(problem_dir="/nonexistent/dir", data_folder="/tmp", log_folder="logs")
+        config = RunConfig(problem_dir="/nonexistent/dir", data_folder="/tmp", log_dir="logs")
         try:
             config.validate()
             assert False, "Should have raised ValueError"
@@ -251,7 +250,7 @@ smpler:
         # Missing evaluate.py and equation.py
         data = tmp_path / "data"
         data.mkdir()
-        config = RunConfig(problem_dir=str(problem), data_folder=str(data), log_folder="logs")
+        config = RunConfig(problem_dir=str(problem), data_folder=str(data), log_dir="logs")
         try:
             config.validate()
             assert False, "Should have raised ValueError"
@@ -264,9 +263,95 @@ smpler:
         (problem / "prompt.txt").write_text("test")
         (problem / "evaluate.py").write_text("def evaluate(data): pass")
         (problem / "equation.py").write_text("def equation(x, params): return x")
-        config = RunConfig(problem_dir=str(problem), data_folder="/nonexistent/folder", log_folder="logs")
+        config = RunConfig(problem_dir=str(problem), data_folder="/nonexistent/folder", log_dir="logs")
         try:
             config.validate()
             assert False, "Should have raised ValueError"
         except ValueError:
             pass
+
+    def test_from_yaml_text(self):
+        """from_yaml_text should parse a YAML string into RunConfig."""
+        yaml_text = """\
+problem_dir: test_dir
+data_folder: data/
+log_dir: logs/
+max_samples: 42
+database:
+  num_islands: 3
+  log_frequency: 25
+"""
+        config = RunConfig.from_yaml_text(yaml_text)
+        assert config.problem_dir == "test_dir"
+        assert config.max_samples == 42
+        assert config.database.num_islands == 3
+        assert config.database.log_frequency == 25
+
+    def test_post_init_resume_from_dir(self, tmp_path):
+        """__post_init__ should resolve a directory to the checkpoint.db inside it."""
+        ckpt = tmp_path / "ckpt"
+        ckpt.mkdir()
+        (ckpt / "checkpoint.db").write_text("fake")
+
+        config = RunConfig(
+            problem_dir="p", data_folder="d",
+            log_dir="logs", resume_from_ckpt=str(ckpt),
+        )
+        assert config.resume_from_ckpt == str(ckpt / "checkpoint.db")
+
+    def test_post_init_resume_from_db_file(self, tmp_path):
+        """__post_init__ should pass through a .db file path unchanged."""
+        db_file = tmp_path / "checkpoint.db"
+        db_file.write_text("fake")
+
+        config = RunConfig(
+            problem_dir="p", data_folder="d",
+            log_dir="logs", resume_from_ckpt=str(db_file),
+        )
+        assert config.resume_from_ckpt == str(db_file)
+
+    def test_post_init_default_save_ckpt_dir(self):
+        """__post_init__ should default save_ckpt_dir to log_dir."""
+        config = RunConfig(log_dir="my_logs")
+        assert config.save_ckpt_dir == "my_logs"
+
+    def test_validate_resume_nonexistent(self, tmp_path):
+        """validate() should raise ValueError for a nonexistent resume path."""
+        problem = tmp_path / "problem"
+        problem.mkdir()
+        (problem / "prompt.txt").write_text("test")
+        (problem / "evaluate.py").write_text("def evaluate(data): pass")
+        (problem / "equation.py").write_text("def equation(x, params): return x")
+        data = tmp_path / "data"
+        data.mkdir()
+
+        config = RunConfig(
+            problem_dir=str(problem), data_folder=str(data),
+            log_dir="logs", resume_from_ckpt="/nonexistent/path",
+        )
+        with pytest.raises(ValueError, match="checkpoint not found"):
+            config.validate()
+
+    def test_backward_compat_old_keys(self, tmp_path):
+        """Old YAML keys (log_folder, problem_name, profiler) should load with warnings."""
+        yaml_content = """\
+problem_dir: test_dir
+data_folder: data/
+log_folder: old_logs
+problem_name: oscillator1
+profiler:
+  log_frequency: 50
+database:
+  num_islands: 5
+"""
+        yaml_path = str(tmp_path / "old.yaml")
+        with open(yaml_path, "w") as f:
+            f.write(yaml_content)
+
+        config = RunConfig.from_yaml(yaml_path)
+        assert config.log_dir == "old_logs"
+        assert config.database.log_frequency == 50
+        assert config.database.num_islands == 5
+        assert not hasattr(config, "log_folder")
+        assert not hasattr(config, "problem_name")
+        assert not hasattr(config, "profiler")

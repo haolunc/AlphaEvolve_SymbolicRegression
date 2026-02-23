@@ -60,17 +60,21 @@ tests/
 └── test_checkpoint.py
 ```
 
-## Quick Start
+## Running & Resuming
+
+| Scenario | Command | Description |
+|----------|---------|-------------|
+| **Fresh start** | `alpha-evolve-sr --config config.yaml` | Start a new experiment |
+| **Resume** | `alpha-evolve-sr --resume <log_dir>` | Resume using config saved in checkpoint DB |
+| **Resume + new config** | `alpha-evolve-sr --config new.yaml --resume <log_dir>` | Resume with updated config |
+
+- `--resume` points to the directory containing `checkpoint.db` (by default, `log_dir`).
+- When using `--resume` alone, the config is loaded from the checkpoint database — no `--config` needed.
+- When using both, the new config overrides the old one (structural fields like `num_islands` and `complexity_bin_size` must match).
 
 ```bash
-# Run with config file (see example_config.yaml for all options)
-alpha-evolve-sr --config example_config.yaml
-
-# Resume from checkpoint
-alpha-evolve-sr --config example_config.yaml --resume_from_ckpt <log_path>/checkpoints
-
 # Monitor with TensorBoard
-tensorboard --logdir <log_path> --port 6006
+tensorboard --logdir <log_dir> --port 6006
 ```
 
 ## Documentation

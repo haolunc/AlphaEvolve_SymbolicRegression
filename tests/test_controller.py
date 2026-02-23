@@ -62,7 +62,7 @@ class TestRestoreOrCreate:
         db2 = ProgramsDatabase.restore_or_create(
             config, SAMPLE_PROMPT, str(tmp_path / "logs2"),
             ckpt_dir=ckpt_dir, max_samples=100,
-            resume_path=ckpt_dir,
+            resume_path=os.path.join(ckpt_dir, "checkpoint.db"),
         )
         assert db2.sample_count == count_before
         db2.finalize()

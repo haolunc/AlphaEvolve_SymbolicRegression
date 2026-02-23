@@ -32,6 +32,7 @@ from . import config as config_lib
 from .checkpoint import CheckpointDB
 from .logging_config import get_logger
 from .messages import EvalResult, ExecutionResult, Prompt, SampleMessage
+from .profiler import ProfileMetrics
 
 logger = get_logger("database")
 
@@ -190,7 +191,6 @@ class ProgramsDatabase:
         config: config_lib.ProgramsDatabaseConfig,
         prompt_text: str,
         log_dir: str,
-        profiler_config: config_lib.ProfilerConfig | None = None,
         *,
         ckpt_dir: str | None = None,
         checkpoint_db: CheckpointDB | None = None,
@@ -216,7 +216,14 @@ class ProgramsDatabase:
         self._best_program_per_island: list[tuple[int, float, int] | None] = [None] * config.num_islands
 
         self._last_reset_step: int = 1
-        self._profiler = profiler.Profiler(log_dir, config=profiler_config)
+        self._success_count: int = 0
+        self._failed_count: int = 0
+        self._tot_sample_time: float = 0.0
+        self._tot_evaluate_time: float = 0.0
+        self._tot_token_cost: float = 0.0
+        self._tb_writer = profiler.TensorBoardWriter(
+            log_dir, log_frequency=config.log_frequency,
+        )
         self._global_sample_nums = 0
 
         # Pareto front: lightweight entries sorted by cbin
@@ -257,30 +264,39 @@ class ProgramsDatabase:
         prompt_text: str,
         log_dir: str,
         *,
-        profiler_config: config_lib.ProfilerConfig | None = None,
         ckpt_dir: str | None = None,
         max_samples: int = 3600,
         resume_path: str | None = None,
         initial_result: EvalResult | None = None,
+        run_config: config_lib.RunConfig | None = None,
     ) -> ProgramsDatabase:
         """Create a new database or restore from checkpoint.
 
         If *resume_path* is given, attempts to load from the SQLite checkpoint.
         Otherwise creates a fresh database and optionally registers *initial_result*.
+
+        Args:
+            run_config: The full RunConfig, stored in the DB on fresh start and
+                validated on resume.
         """
         import shutil
 
         if resume_path:
-            resume_db_path = os.path.join(resume_path, "checkpoint.db")
+            resume_db_path = resume_path
             if os.path.exists(resume_db_path):
                 try:
                     resume_db = CheckpointDB(resume_db_path)
                     if resume_db.is_populated:
+                        # Validate structural config before restoring
+                        resume_db.validate_config(
+                            config.num_islands, config.complexity_bin_size,
+                        )
+
                         # Determine the ongoing write DB
-                        if ckpt_dir and os.path.normpath(ckpt_dir) != os.path.normpath(resume_path):
+                        dest_db_path = os.path.join(ckpt_dir, "checkpoint.db") if ckpt_dir else None
+                        if dest_db_path and os.path.normpath(dest_db_path) != os.path.normpath(resume_db_path):
                             os.makedirs(ckpt_dir, exist_ok=True)
                             resume_db.close()
-                            dest_db_path = os.path.join(ckpt_dir, "checkpoint.db")
                             shutil.copy2(resume_db_path, dest_db_path)
                             # Also copy WAL/SHM if present
                             for suffix in ("-wal", "-shm"):
@@ -293,11 +309,20 @@ class ProgramsDatabase:
 
                         db = cls(
                             config, prompt_text, log_dir,
-                            profiler_config=profiler_config,
                             ckpt_dir=ckpt_dir, checkpoint_db=checkpoint_db,
                             max_samples=max_samples,
                         )
                         db._restore_from_db(checkpoint_db)
+
+                        # Update stored config YAML (allow non-structural changes)
+                        if run_config is not None:
+                            with checkpoint_db.transaction():
+                                checkpoint_db.save_run_config(
+                                    run_config,
+                                    config.num_islands,
+                                    config.complexity_bin_size,
+                                )
+
                         logger.info(
                             "Database restored from checkpoint with %d samples",
                             db.sample_count,
@@ -307,9 +332,9 @@ class ProgramsDatabase:
                         resume_db.close()
                 except Exception as e:
                     logger.error("Failed to load checkpoint: %s", e)
-                    logger.info("Initializing new database instead")
+                    raise
             else:
-                logger.info("No checkpoint.db found at %s, starting fresh", resume_path)
+                logger.info("No checkpoint.db found at %s, starting fresh", resume_db_path)
 
         # Fresh start
         checkpoint_db = None
@@ -319,9 +344,16 @@ class ProgramsDatabase:
 
         db = cls(
             config, prompt_text, log_dir,
-            profiler_config=profiler_config,
             ckpt_dir=ckpt_dir, checkpoint_db=checkpoint_db, max_samples=max_samples,
         )
+
+        # Store config in DB on fresh start
+        if run_config is not None and checkpoint_db is not None:
+            with checkpoint_db.transaction():
+                checkpoint_db.save_run_config(
+                    run_config, config.num_islands, config.complexity_bin_size,
+                )
+
         if initial_result is not None:
             db.register_program(initial_result)
         return db
@@ -334,49 +366,44 @@ class ProgramsDatabase:
             if island_id < len(self._islands):
                 self._islands[island_id]._bins = bins
 
-        # Load pareto front — reconstruct ParetoEntry from stored programs
-        pareto_ids = checkpoint_db.load_pareto_front_ids()
-        if pareto_ids:
-            pareto_programs = checkpoint_db.load_programs_by_ids(pareto_ids)
-            bin_size = self._config.complexity_bin_size
-            entries = []
-            for gsn in pareto_ids:
-                if gsn in pareto_programs:
-                    p = pareto_programs[gsn]
-                    entries.append(ParetoEntry(
-                        cbin=p.complexity // bin_size,
-                        score=p.score,
-                        gsn=gsn,
-                    ))
-            self._pareto_front = sorted(entries, key=lambda e: e.cbin)
+        # Load pareto front from self-contained table
+        pareto_rows = checkpoint_db.load_pareto_front()
+        self._pareto_front = [
+            ParetoEntry(cbin=cbin, score=score, gsn=gsn)
+            for cbin, score, gsn in pareto_rows
+        ]
 
-        # Load metadata
-        meta = checkpoint_db.load_metadata()
-        self._global_sample_nums = meta.get("global_sample_nums", 0)
-        self._last_reset_step = meta.get("last_reset_step", 1)
+        # Load global stats
+        stats = checkpoint_db.load_global_stats()
+        if stats is not None:
+            self._global_sample_nums = stats["global_sample_num"]
+            self._last_reset_step = stats["last_reset_step"]
+            self._success_count = stats["success_count"]
+            self._failed_count = stats["failed_count"]
+            self._tot_sample_time = stats["tot_sample_time"]
+            self._tot_evaluate_time = stats["tot_evaluate_time"]
+            self._tot_token_cost = stats["tot_token_cost"]
 
-        best_scores = meta.get("best_score_per_island", [-float("inf")] * len(self._islands))
-        for i, s in enumerate(best_scores):
-            if i < len(self._best_score_per_island):
-                self._best_score_per_island[i] = s
-
-        best_prog_entries = meta.get("best_program_per_island", [None] * len(self._islands))
-        for i, entry in enumerate(best_prog_entries):
-            if i >= len(self._best_program_per_island) or entry is None:
-                continue
-            if isinstance(entry, list) and len(entry) == 3:
-                # New format: [gsn, score, complexity]
-                self._best_program_per_island[i] = tuple(entry)
-
-        # Restore profiler
-        profiler_stats = checkpoint_db.load_profiler_stats()
-        if profiler_stats is not None:
-            self._profiler.restore_stats(profiler_stats)
-            self._profiler._num_samples = self._global_sample_nums
+        # Load island stats
+        island_stats = checkpoint_db.load_island_stats()
+        for entry in island_stats:
+            iid = entry["island_id"]
+            if iid < len(self._best_score_per_island):
+                self._best_score_per_island[iid] = entry["best_score"]
+                best_gsn = entry["best_gsn"]
+                if best_gsn is not None:
+                    # Load the program to get its complexity for the tuple
+                    progs = checkpoint_db.load_programs_by_ids([best_gsn])
+                    if best_gsn in progs:
+                        p = progs[best_gsn]
+                        self._best_program_per_island[iid] = (best_gsn, p.score, p.complexity)
 
     def finalize(self) -> None:
-        """Close the checkpoint DB."""
+        """Flush derived data and close the checkpoint DB."""
         if self._checkpoint_db:
+            # Final checkpoint of all derived data
+            with self._checkpoint_db.transaction():
+                self._checkpoint_derived()
             self._checkpoint_db.close()
 
     def get_prompt(self) -> Prompt:
@@ -484,6 +511,7 @@ class ProgramsDatabase:
     ) -> None:
         """Core registration + DB persistence (runs inside a transaction)."""
         db = self._checkpoint_db
+        # Programs table: written every step (irreplaceable raw data)
         db.insert_program(evaluated, llm_response_text=llm_response_text)
 
         if ex is not None:
@@ -501,34 +529,84 @@ class ProgramsDatabase:
 
             self._update_pareto_front(evaluated)
 
-        self._profiler.register_function(
-            evaluated,
-            pareto_front=self._pareto_front,
-            best_score_per_island=self._best_score_per_island,
-            island_sizes=[isl.num_programs for isl in self._islands],
+        self._update_profiling_stats(evaluated)
+        logger.info(
+            "Evaluated Function: score=%s complexity=%s sample_order=%s",
+            evaluated.score,
+            evaluated.complexity,
+            evaluated.global_sample_nums,
         )
+        self._tb_writer.write(self._build_profile_metrics())
 
-        # Periodic checkpoint of island index
+        # Periodic checkpoint of all derived data
         self._steps_since_checkpoint += 1
         if self._steps_since_checkpoint >= self._config.checkpoint_interval:
-            db.checkpoint_island_index(self._islands, self._config.num_islands)
+            self._checkpoint_derived()
             self._steps_since_checkpoint = 0
-
-        db.replace_pareto_front([p.gsn for p in self._pareto_front])
-        db.save_profiler_stats(self._profiler)
-        db.save_metadata("global_sample_nums", self._global_sample_nums)
-        db.save_metadata("last_reset_step", self._last_reset_step)
-        db.save_metadata(
-            "best_score_per_island", self._best_score_per_island,
-        )
-        db.save_metadata(
-            "best_program_per_island",
-            [list(t) if t else None for t in self._best_program_per_island],
-        )
 
         if self._global_sample_nums - self._last_reset_step > self._config.reset_period:
             self._last_reset_step = self._global_sample_nums
             self.reset_islands()
+
+    def _checkpoint_derived(self) -> None:
+        """Write all derived tables in a single batch.
+
+        Called every ``checkpoint_interval`` steps. All derived tables can be
+        rebuilt from ``programs`` + ``island_bins`` on crash, so staleness
+        between checkpoints is acceptable.
+        """
+        db = self._checkpoint_db
+        db.checkpoint_island_bins(self._islands, self._config.num_islands)
+        db.save_pareto_front(self._pareto_front)
+        db.save_global_stats(
+            global_sample_num=self._global_sample_nums,
+            last_reset_step=self._last_reset_step,
+            best_score=max(self._best_score_per_island),
+            success_count=self._success_count,
+            failed_count=self._failed_count,
+            tot_sample_time=self._tot_sample_time,
+            tot_evaluate_time=self._tot_evaluate_time,
+            tot_token_cost=self._tot_token_cost,
+        )
+        db.save_island_stats([
+            (
+                iid,
+                self._islands[iid].num_programs,
+                self._best_score_per_island[iid],
+                self._best_program_per_island[iid][0] if self._best_program_per_island[iid] else None,
+            )
+            for iid in range(self._config.num_islands)
+        ])
+
+    def _update_profiling_stats(self, program: code_manipulation.EvaluatedProgram) -> None:
+        """Update aggregate profiling statistics with a newly evaluated *program*."""
+        score = program.score
+
+        if score:
+            self._success_count += 1
+        else:
+            self._failed_count += 1
+        if program.sample_time:
+            self._tot_sample_time += program.sample_time
+        if program.evaluate_time:
+            self._tot_evaluate_time += program.evaluate_time
+        if program.token_cost:
+            self._tot_token_cost += program.token_cost
+
+    def _build_profile_metrics(self) -> ProfileMetrics:
+        """Construct a ``ProfileMetrics`` snapshot for TensorBoard."""
+        return ProfileMetrics(
+            num_samples=self._global_sample_nums,
+            best_score=max(self._best_score_per_island),
+            tot_token_cost=self._tot_token_cost,
+            success_count=self._success_count,
+            failed_count=self._failed_count,
+            tot_sample_time=self._tot_sample_time,
+            tot_evaluate_time=self._tot_evaluate_time,
+            pareto_front=self._pareto_front,
+            best_score_per_island=self._best_score_per_island,
+            island_sizes=[isl.num_programs for isl in self._islands],
+        )
 
     def _update_pareto_front(self, program: code_manipulation.EvaluatedProgram) -> None:
         """Update the Pareto front with *program* if it is non-dominated.
@@ -576,7 +654,5 @@ class ProgramsDatabase:
             self._best_program_per_island[island_id] = founder
             logger.info("Reset island %d with founder %d", island_id, founder[0])
         # Force checkpoint after reset
-        self._checkpoint_db.checkpoint_island_index(
-            self._islands, self._config.num_islands,
-        )
+        self._checkpoint_derived()
         self._steps_since_checkpoint = 0

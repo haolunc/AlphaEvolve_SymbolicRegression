@@ -24,8 +24,7 @@ class TestMainSingleSampleAccess:
         ]
 
         run_config = RunConfig(
-            resume_from_ckpt=None,
-            log_path=str(tmp_path / "logs"),
+            log_dir=str(tmp_path / "logs"),
             save_ckpt_dir=None,
             max_samples=1,
             sampler=SamplerConfig(samples_per_prompt=1),
@@ -66,8 +65,7 @@ class TestMainSingleSampleAccess:
         ]
 
         run_config = RunConfig(
-            resume_from_ckpt=None,
-            log_path=str(tmp_path / "logs"),
+            log_dir=str(tmp_path / "logs"),
             save_ckpt_dir=None,
             max_samples=1,
             sampler=SamplerConfig(samples_per_prompt=2),
@@ -103,8 +101,7 @@ class TestMainSingleSampleAccess:
         mock_database.should_stop = True  # stop after first iteration
 
         run_config = RunConfig(
-            resume_from_ckpt=None,
-            log_path=str(tmp_path / "logs"),
+            log_dir=str(tmp_path / "logs"),
             save_ckpt_dir=None,
             max_samples=1,
             sampler=SamplerConfig(samples_per_prompt=1),

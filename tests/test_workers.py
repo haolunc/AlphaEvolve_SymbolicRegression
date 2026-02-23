@@ -7,14 +7,14 @@ from unittest.mock import MagicMock, patch
 from alpha_evolve_sr.config import RunConfig
 
 
-class TestMonitoringWorkerLogPath:
-    """Verify monitoring_worker uses run_config.log_path for logger."""
+class TestMonitoringWorkerLogDir:
+    """Verify monitoring_worker uses run_config.log_dir for logger."""
 
-    def test_log_path_from_run_config(self, tmp_path):
-        """monitoring_worker should pass run_config.log_path to setup_file_logger."""
+    def test_log_dir_from_run_config(self, tmp_path):
+        """monitoring_worker should pass run_config.log_dir to setup_file_logger."""
         log_dir = str(tmp_path / "custom_logs")
         run_config = RunConfig(
-            log_path=log_dir,
+            log_dir=log_dir,
             num_samplers=1,
             num_evaluators=1,
         )
@@ -34,8 +34,8 @@ class TestMonitoringWorkerLogPath:
 
         mock_sfl.assert_called_once_with("monitor", log_dir)
 
-    def test_log_path_defaults_to_logger(self, tmp_path):
-        """If run_config has no log_path, fallback to './logger'."""
+    def test_log_dir_defaults_to_logger(self, tmp_path):
+        """If run_config has no log_dir, fallback to './logger'."""
         run_config = RunConfig(num_samplers=1, num_evaluators=1)
 
         import multiprocessing as mp

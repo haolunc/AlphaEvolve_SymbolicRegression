@@ -217,3 +217,4 @@ class TestIslandProperties:
         """num_programs reflects how many programs have been registered."""
         island = db._islands[0]
         assert island.num_programs >= 1
+

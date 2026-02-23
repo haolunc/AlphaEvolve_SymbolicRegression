@@ -2,62 +2,48 @@
 
 from __future__ import annotations
 
-from alpha_evolve_sr.code_manipulation import EvaluatedProgram, ParsedFunction
-from alpha_evolve_sr.profiler import Profiler
+from alpha_evolve_sr.profiler import ProfileMetrics, TensorBoardWriter
 
 
-def _make_program(sample_order: int, score: float = -1.0) -> EvaluatedProgram:
-    """Helper to create an EvaluatedProgram with the given sample order and score."""
-    parsed = ParsedFunction(
-        name="equation",
-        args="x, params",
-        body="    return x",
-    )
-    return EvaluatedProgram(
-        parsed=parsed,
-        score=score,
-        optimized_params=None,
-        complexity=5,
-        complexity_detail={"BinOp": 1},
-        global_sample_nums=sample_order,
-        sample_time=0.1,
-        evaluate_time=0.2,
-        token_usage=(10, 20),
-        token_cost=0.001,
-    )
+class TestTensorBoardWriter:
+    """Tests for TensorBoardWriter.write(ProfileMetrics)."""
 
+    def test_write_completes_without_error(self, tmp_path):
+        """A basic write with ProfileMetrics should not raise."""
+        writer = TensorBoardWriter(
+            log_dir=str(tmp_path / "logs"),
+        )
+        metrics = ProfileMetrics(
+            num_samples=1,
+            best_score=-1.0,
+            tot_token_cost=0.001,
+            success_count=1,
+            failed_count=0,
+            tot_sample_time=0.1,
+            tot_evaluate_time=0.2,
+        )
+        writer.write(metrics)
 
-class TestProfilerCounter:
-    """Tests for Profiler counter logic."""
+    def test_write_with_optional_fields(self, tmp_path):
+        """Write with pareto_front, best_score_per_island, island_sizes."""
+        from alpha_evolve_sr.database import ParetoEntry
 
-    def test_sequential_samples_all_logged(self, tmp_path):
-        """Register 3 samples in order — all should be counted."""
-        profiler = Profiler(log_dir=str(tmp_path / "logs"))
-
-        for i in range(1, 4):
-            profiler.register_function(_make_program(sample_order=i))
-
-        assert profiler._num_samples == 3
-
-    def test_out_of_order_samples_not_lost(self, tmp_path):
-        """Register samples as [1, 3, 2] — high-water mark should be 3."""
-        profiler = Profiler(log_dir=str(tmp_path / "logs"))
-
-        for order in [1, 3, 2]:
-            profiler.register_function(_make_program(sample_order=order))
-
-        assert profiler._num_samples == 3
-
-    def test_high_water_mark_tracked(self, tmp_path):
-        """_num_samples should track the highest sample order seen."""
-        profiler = Profiler(log_dir=str(tmp_path / "logs"))
-
-        profiler.register_function(_make_program(sample_order=1))
-        assert profiler._num_samples == 1
-
-        profiler.register_function(_make_program(sample_order=5))
-        assert profiler._num_samples == 5
-
-        # Out-of-order sample — high-water mark shouldn't decrease
-        profiler.register_function(_make_program(sample_order=3))
-        assert profiler._num_samples == 5
+        writer = TensorBoardWriter(
+            log_dir=str(tmp_path / "logs"), log_frequency=1,
+        )
+        metrics = ProfileMetrics(
+            num_samples=1,
+            best_score=-0.5,
+            tot_token_cost=0.01,
+            success_count=5,
+            failed_count=2,
+            tot_sample_time=1.0,
+            tot_evaluate_time=2.0,
+            pareto_front=[
+                ParetoEntry(cbin=0, score=-1.0, gsn=1),
+                ParetoEntry(cbin=1, score=-0.5, gsn=2),
+            ],
+            best_score_per_island=[-1.0, -0.5],
+            island_sizes=[10, 20],
+        )
+        writer.write(metrics)

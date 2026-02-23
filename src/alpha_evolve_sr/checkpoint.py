@@ -6,7 +6,6 @@ import json
 import os
 import sqlite3
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -15,66 +14,7 @@ from .config import RunConfig
 from .exceptions import CheckpointError
 from .logging_config import get_logger
 
-if TYPE_CHECKING:
-    from .profiler import Profiler
-
 logger = get_logger("checkpoint")
-
-_SENTINEL_NEG_INF = "__NEG_INF__"
-
-
-def _json_encode(value: Any) -> str:
-    """JSON-encode *value*, handling -inf and numpy types."""
-    def _default(obj: Any) -> Any:
-        if isinstance(obj, np.ndarray):
-            return obj.tolist()
-        if isinstance(obj, (np.integer,)):
-            return int(obj)
-        if isinstance(obj, (np.floating,)):
-            return float(obj)
-        raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
-
-    if isinstance(value, float) and value == float("-inf"):
-        return json.dumps(_SENTINEL_NEG_INF)
-    if isinstance(value, list):
-        value = [_SENTINEL_NEG_INF if (isinstance(v, float) and v == float("-inf")) else v for v in value]
-    return json.dumps(value, default=_default)
-
-
-def _json_decode(text: str) -> Any:
-    """JSON-decode *text*, restoring -inf sentinels."""
-    value = json.loads(text)
-    if value == _SENTINEL_NEG_INF:
-        return float("-inf")
-    if isinstance(value, list):
-        return [float("-inf") if v == _SENTINEL_NEG_INF else v for v in value]
-    return value
-
-
-# ---------------------------------------------------------------------------
-# Config persistence (unchanged)
-# ---------------------------------------------------------------------------
-
-def save_config(run_config: RunConfig, save_dir: str) -> None:
-    """Save a RunConfig to a YAML file in *save_dir*."""
-    os.makedirs(save_dir, exist_ok=True)
-    run_config.to_yaml(os.path.join(save_dir, "run_config.yaml"))
-
-
-def load_config(ckpt_dir: str) -> RunConfig:
-    """Load a RunConfig from a previously saved YAML file in *ckpt_dir*."""
-    yaml_path = os.path.join(ckpt_dir, "run_config.yaml")
-
-    if os.path.exists(yaml_path):
-        try:
-            config = RunConfig.from_yaml(yaml_path)
-            logger.info("Loaded configuration from %s", yaml_path)
-            return config
-        except Exception as e:
-            logger.error("Failed to load config from %s: %s", yaml_path, e)
-            raise CheckpointError(f"Failed to load config from {yaml_path}: {e}") from e
-    else:
-        raise CheckpointError(f"No run_config.yaml found at {yaml_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -105,65 +45,46 @@ CREATE TABLE IF NOT EXISTS programs (
     llm_response_text   TEXT
 );
 
-CREATE TABLE IF NOT EXISTS island_programs (
+CREATE TABLE IF NOT EXISTS island_bins (
     island_id           INTEGER NOT NULL,
     complexity_bin      INTEGER NOT NULL,
-    global_sample_num   INTEGER NOT NULL REFERENCES programs(global_sample_num),
+    global_sample_num   INTEGER NOT NULL,
     score               REAL    NOT NULL,
-    PRIMARY KEY (island_id, global_sample_num)
+    PRIMARY KEY (island_id, complexity_bin, global_sample_num)
 );
-CREATE INDEX IF NOT EXISTS idx_ip_island_bin ON island_programs(island_id, complexity_bin);
 
 CREATE TABLE IF NOT EXISTS pareto_front (
-    global_sample_num   INTEGER PRIMARY KEY REFERENCES programs(global_sample_num)
+    complexity_bin      INTEGER PRIMARY KEY,
+    score               REAL    NOT NULL,
+    global_sample_num   INTEGER NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS metadata (
-    key   TEXT PRIMARY KEY,
-    value TEXT NOT NULL
+CREATE TABLE IF NOT EXISTS global_stats (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    global_sample_num   INTEGER NOT NULL DEFAULT 0,
+    last_reset_step     INTEGER NOT NULL DEFAULT 1,
+    best_score          REAL,
+    success_count       INTEGER NOT NULL DEFAULT 0,
+    failed_count        INTEGER NOT NULL DEFAULT 0,
+    tot_sample_time     REAL    NOT NULL DEFAULT 0.0,
+    tot_evaluate_time   REAL    NOT NULL DEFAULT 0.0,
+    tot_token_cost      REAL    NOT NULL DEFAULT 0.0
 );
 
-CREATE TABLE IF NOT EXISTS profiler_stats (
-    id                        INTEGER PRIMARY KEY CHECK (id = 1),
-    best_score                REAL    NOT NULL DEFAULT 0,
-    success_count             INTEGER NOT NULL DEFAULT 0,
-    failed_count              INTEGER NOT NULL DEFAULT 0,
-    tot_sample_time           REAL    NOT NULL DEFAULT 0.0,
-    tot_evaluate_time         REAL    NOT NULL DEFAULT 0.0,
-    tot_token_cost            REAL    NOT NULL DEFAULT 0.0
+CREATE TABLE IF NOT EXISTS island_stats (
+    island_id           INTEGER PRIMARY KEY,
+    size                INTEGER NOT NULL DEFAULT 0,
+    best_score          REAL,
+    best_gsn            INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS run_config (
+    id                  INTEGER PRIMARY KEY CHECK (id = 1),
+    config_yaml         TEXT    NOT NULL,
+    num_islands         INTEGER NOT NULL,
+    complexity_bin_size INTEGER NOT NULL
 );
 """
-
-
-def _migrate_schema(conn: sqlite3.Connection) -> None:
-    """Migrate old schema to current if needed."""
-    # Check if programs table has island_id column (old schema)
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(programs)").fetchall()}
-    if "island_id" in cols:
-        # SQLite can't drop columns easily; just leave island_id in place.
-        logger.info("Old schema detected: programs.island_id present (kept for compatibility)")
-
-    # Check if island_programs table has score column
-    ip_cols = {row[1] for row in conn.execute("PRAGMA table_info(island_programs)").fetchall()}
-    if "score" not in ip_cols:
-        logger.info("Migrating island_programs: adding score column")
-        conn.execute("ALTER TABLE island_programs ADD COLUMN score REAL NOT NULL DEFAULT 0.0")
-        # Backfill score from programs table
-        conn.execute(
-            "UPDATE island_programs SET score = "
-            "(SELECT p.score FROM programs p WHERE p.global_sample_num = island_programs.global_sample_num)"
-        )
-        conn.commit()
-        logger.info("Migration complete: island_programs.score backfilled")
-
-    # Drop legacy profiler_per_complexity table
-    tables = {row[0] for row in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'",
-    ).fetchall()}
-    if "profiler_per_complexity" in tables:
-        logger.info("Dropping legacy profiler_per_complexity table")
-        conn.execute("DROP TABLE profiler_per_complexity")
-        conn.commit()
 
 
 class CheckpointDB:
@@ -175,7 +96,6 @@ class CheckpointDB:
                 os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
             self._conn = sqlite3.connect(db_path, timeout=30)
             self._conn.executescript(_SCHEMA_SQL)
-            _migrate_schema(self._conn)
             self._conn.execute("PRAGMA journal_mode = WAL")
             self._conn.execute("PRAGMA synchronous = NORMAL")
             self._conn.execute("PRAGMA foreign_keys = ON")
@@ -248,74 +168,96 @@ class CheckpointDB:
             ),
         )
 
-    def insert_island_program(
-        self, island_id: int, complexity_bin: int, global_sample_num: int,
-        score: float,
-    ) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO island_programs"
-            " (island_id, complexity_bin, global_sample_num, score)"
-            " VALUES (?, ?, ?, ?)",
-            (island_id, complexity_bin, global_sample_num, score),
-        )
-
-    def delete_island_programs(self, island_id: int, evicted_ids: list[int]) -> None:
-        if not evicted_ids:
-            return
-        placeholders = ",".join("?" * len(evicted_ids))
-        self._conn.execute(
-            f"DELETE FROM island_programs WHERE island_id = ? AND global_sample_num IN ({placeholders})",
-            [island_id, *evicted_ids],
-        )
-
-    def reset_island(self, island_id: int) -> None:
-        self._conn.execute(
-            "DELETE FROM island_programs WHERE island_id = ?", (island_id,),
-        )
-
-    def checkpoint_island_index(
+    def checkpoint_island_bins(
         self, islands: list, num_islands: int,
     ) -> None:
-        """Replace all island_programs rows with current in-memory state."""
-        self._conn.execute("DELETE FROM island_programs")
+        """Replace all island_bins rows with current in-memory state."""
+        self._conn.execute("DELETE FROM island_bins")
         for island_id in range(num_islands):
             for cbin, entries in islands[island_id]._bins.items():
                 for gsn, score in entries:
                     self._conn.execute(
-                        "INSERT INTO island_programs VALUES (?, ?, ?, ?)",
+                        "INSERT INTO island_bins VALUES (?, ?, ?, ?)",
                         (island_id, cbin, gsn, score),
                     )
 
-    def replace_pareto_front(self, front_ids: list[int]) -> None:
+    def save_pareto_front(self, pareto_entries: list) -> None:
+        """Replace pareto_front table with current entries.
+
+        Args:
+            pareto_entries: list of ParetoEntry(cbin, score, gsn) namedtuples.
+        """
         self._conn.execute("DELETE FROM pareto_front")
         self._conn.executemany(
-            "INSERT INTO pareto_front (global_sample_num) VALUES (?)",
-            [(fid,) for fid in front_ids],
+            "INSERT INTO pareto_front (complexity_bin, score, global_sample_num)"
+            " VALUES (?, ?, ?)",
+            [(p.cbin, p.score, p.gsn) for p in pareto_entries],
         )
 
-    def save_metadata(self, key: str, value: Any) -> None:
-        encoded = _json_encode(value)
+    def save_global_stats(
+        self,
+        global_sample_num: int,
+        last_reset_step: int,
+        best_score: float | None,
+        success_count: int,
+        failed_count: int,
+        tot_sample_time: float,
+        tot_evaluate_time: float,
+        tot_token_cost: float,
+    ) -> None:
+        best_score_val = best_score if (best_score is not None and best_score != float("-inf")) else None
         self._conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-            (key, encoded),
-        )
-
-    def save_profiler_stats(self, profiler: Profiler) -> None:
-        stats = profiler.get_stats_snapshot()
-        self._conn.execute(
-            """INSERT OR REPLACE INTO profiler_stats (
-                id, best_score,
-                success_count, failed_count, tot_sample_time, tot_evaluate_time,
-                tot_token_cost
-            ) VALUES (1, ?, ?, ?, ?, ?, ?)""",
+            """INSERT OR REPLACE INTO global_stats (
+                id, global_sample_num, last_reset_step, best_score,
+                success_count, failed_count,
+                tot_sample_time, tot_evaluate_time, tot_token_cost
+            ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                stats["best_score"] if stats["best_score"] != float("-inf") else None,
-                stats["success_count"],
-                stats["failed_count"],
-                stats["tot_sample_time"],
-                stats["tot_evaluate_time"],
-                stats["tot_token_cost"],
+                global_sample_num, last_reset_step, best_score_val,
+                success_count, failed_count,
+                tot_sample_time, tot_evaluate_time, tot_token_cost,
             ),
+        )
+
+    def save_island_stats(
+        self,
+        island_stats: list[tuple[int, int, float | None, int | None]],
+    ) -> None:
+        """Replace island_stats with current per-island data.
+
+        Args:
+            island_stats: list of (island_id, size, best_score, best_gsn) tuples.
+        """
+        self._conn.execute("DELETE FROM island_stats")
+        for island_id, size, best_score, best_gsn in island_stats:
+            best_score_val = best_score if (best_score is not None and best_score != float("-inf")) else None
+            self._conn.execute(
+                "INSERT INTO island_stats (island_id, size, best_score, best_gsn)"
+                " VALUES (?, ?, ?, ?)",
+                (island_id, size, best_score_val, best_gsn),
+            )
+
+    def save_run_config(
+        self,
+        run_config: RunConfig,
+        num_islands: int,
+        complexity_bin_size: int,
+    ) -> None:
+        """Store run config in the DB (called once on fresh start, updated on resume)."""
+        import dataclasses
+        import io
+
+        import yaml
+
+        buf = io.StringIO()
+        yaml.dump(dataclasses.asdict(run_config), buf, default_flow_style=False, sort_keys=False)
+        config_yaml = buf.getvalue()
+
+        self._conn.execute(
+            """INSERT OR REPLACE INTO run_config (
+                id, config_yaml, num_islands, complexity_bin_size
+            ) VALUES (1, ?, ?, ?)""",
+            (config_yaml, num_islands, complexity_bin_size),
         )
 
     # ---- Read operations -------------------------------------------------
@@ -326,23 +268,12 @@ class CheckpointDB:
         """Convert raw SQL rows into EvaluatedProgram objects."""
         programs: dict[int, code_manipulation.EvaluatedProgram] = {}
         for row in rows:
-            # Handle both old schema (with island_id) and new schema (without)
-            if len(row) == 17:
-                # Old schema: has island_id column
-                (
-                    gsn, _island_id, func_name, func_args, func_body,
-                    func_return_type, func_docstring, score, opt_params_json,
-                    complexity, complexity_detail_json, sample_time, evaluate_time,
-                    token_input, token_output, token_cost, _llm_text,
-                ) = row
-            else:
-                # New schema: no island_id column
-                (
-                    gsn, func_name, func_args, func_body,
-                    func_return_type, func_docstring, score, opt_params_json,
-                    complexity, complexity_detail_json, sample_time, evaluate_time,
-                    token_input, token_output, token_cost, _llm_text,
-                ) = row
+            (
+                gsn, func_name, func_args, func_body,
+                func_return_type, func_docstring, score, opt_params_json,
+                complexity, complexity_detail_json, sample_time, evaluate_time,
+                token_input, token_output, token_cost, _llm_text,
+            ) = row
             parsed = code_manipulation.ParsedFunction(
                 name=func_name,
                 args=func_args,
@@ -392,7 +323,7 @@ class CheckpointDB:
         """
         rows = self._conn.execute(
             "SELECT island_id, complexity_bin, global_sample_num, score "
-            "FROM island_programs ORDER BY rowid",
+            "FROM island_bins ORDER BY rowid",
         ).fetchall()
         result: dict[int, dict[int, list[tuple[int, float]]]] = {}
         for island_id, complexity_bin, gsn, score in rows:
@@ -401,46 +332,87 @@ class CheckpointDB:
             )
         return result
 
-    def load_island_memberships(self) -> dict[int, dict[int, list[int]]]:
-        """Returns ``{island_id: {complexity_bin: [global_sample_num, ...]}}``.
-
-        Legacy convenience wrapper; prefer load_island_index for new code.
-        """
+    def load_pareto_front(self) -> list[tuple[int, float, int]]:
+        """Returns list of (complexity_bin, score, global_sample_num) tuples."""
         rows = self._conn.execute(
-            "SELECT island_id, complexity_bin, global_sample_num FROM island_programs ORDER BY rowid",
+            "SELECT complexity_bin, score, global_sample_num FROM pareto_front"
+            " ORDER BY complexity_bin",
         ).fetchall()
-        result: dict[int, dict[int, list[int]]] = {}
-        for island_id, complexity_bin, gsn in rows:
-            result.setdefault(island_id, {}).setdefault(complexity_bin, []).append(gsn)
-        return result
+        return [(cbin, score, gsn) for cbin, score, gsn in rows]
 
-    def load_pareto_front_ids(self) -> list[int]:
-        rows = self._conn.execute("SELECT global_sample_num FROM pareto_front").fetchall()
-        return [r[0] for r in rows]
-
-    def load_metadata(self) -> dict[str, Any]:
-        rows = self._conn.execute("SELECT key, value FROM metadata").fetchall()
-        return {k: _json_decode(v) for k, v in rows}
-
-    def load_profiler_stats(self) -> dict | None:
+    def load_global_stats(self) -> dict | None:
         row = self._conn.execute(
-            """SELECT best_score,
-                      success_count, failed_count, tot_sample_time,
-                      tot_evaluate_time, tot_token_cost
-               FROM profiler_stats WHERE id = 1""",
+            """SELECT global_sample_num, last_reset_step, best_score,
+                      success_count, failed_count,
+                      tot_sample_time, tot_evaluate_time, tot_token_cost
+               FROM global_stats WHERE id = 1""",
         ).fetchone()
         if row is None:
             return None
         return {
-            "best_score": row[0] if row[0] is not None else float("-inf"),
-            "success_count": row[1],
-            "failed_count": row[2],
-            "tot_sample_time": row[3],
-            "tot_evaluate_time": row[4],
-            "tot_token_cost": row[5],
+            "global_sample_num": row[0],
+            "last_reset_step": row[1],
+            "best_score": row[2] if row[2] is not None else float("-inf"),
+            "success_count": row[3],
+            "failed_count": row[4],
+            "tot_sample_time": row[5],
+            "tot_evaluate_time": row[6],
+            "tot_token_cost": row[7],
         }
+
+    def load_island_stats(self) -> list[dict]:
+        """Returns list of dicts with island_id, size, best_score, best_gsn."""
+        rows = self._conn.execute(
+            "SELECT island_id, size, best_score, best_gsn FROM island_stats"
+            " ORDER BY island_id",
+        ).fetchall()
+        return [
+            {
+                "island_id": r[0],
+                "size": r[1],
+                "best_score": r[2] if r[2] is not None else float("-inf"),
+                "best_gsn": r[3],
+            }
+            for r in rows
+        ]
+
+    def load_run_config(self) -> dict | None:
+        """Load the stored run_config row. Returns dict or None if not stored."""
+        row = self._conn.execute(
+            "SELECT config_yaml, num_islands, complexity_bin_size"
+            " FROM run_config WHERE id = 1",
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "config_yaml": row[0],
+            "num_islands": row[1],
+            "complexity_bin_size": row[2],
+        }
+
+    def validate_config(self, num_islands: int, complexity_bin_size: int) -> None:
+        """Validate that structural config matches stored checkpoint.
+
+        Raises:
+            CheckpointError: if num_islands or complexity_bin_size differ.
+        """
+        stored = self.load_run_config()
+        if stored is None:
+            return  # No stored config to validate against
+        if stored["num_islands"] != num_islands:
+            raise CheckpointError(
+                f"Config mismatch on resume: num_islands={num_islands} "
+                f"but checkpoint has num_islands={stored['num_islands']}. "
+                f"Changing num_islands mid-run is not supported."
+            )
+        if stored["complexity_bin_size"] != complexity_bin_size:
+            raise CheckpointError(
+                f"Config mismatch on resume: complexity_bin_size={complexity_bin_size} "
+                f"but checkpoint has complexity_bin_size={stored['complexity_bin_size']}. "
+                f"Changing complexity_bin_size mid-run is not supported."
+            )
 
     @property
     def is_populated(self) -> bool:
-        row = self._conn.execute("SELECT COUNT(*) FROM metadata").fetchone()
+        row = self._conn.execute("SELECT COUNT(*) FROM global_stats").fetchone()
         return row[0] > 0

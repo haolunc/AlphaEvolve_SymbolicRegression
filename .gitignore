@@ -15,3 +15,6 @@ logger/
 scratch/
 docs_ref/
 docs/_build/
+.claude/
+.pytest_cache/
+.ruff_cache/
