@@ -517,6 +517,7 @@ class ProgramsDatabase:
             token_cost=cost,
             error_type=eval_result.error_type,
             error_message=eval_result.error_message,
+            eval_output=eval_result.eval_output,
         )
 
         with self._checkpoint_db.transaction():

@@ -70,33 +70,63 @@ class TestSandbox:
 
     def test_successful_execution(self, sandbox):
         program = "def evaluate(data):\n    return (data['x'].sum(), [1.0]), True\n"
-        result, success, error_str = sandbox.run(program, {"x": __import__("numpy").array([1, 2, 3])}, 10)
+        result, success, error_str, eval_output = sandbox.run(program, {"x": __import__("numpy").array([1, 2, 3])}, 10)
         assert success
         assert result is not None
         assert error_str is None
 
     def test_timeout_returns_none(self, sandbox):
         program = "import time\ndef evaluate(data):\n    time.sleep(100)\n    return None, True\n"
-        result, success, error_str = sandbox.run(program, {}, 1)
+        result, success, error_str, eval_output = sandbox.run(program, {}, 1)
         assert not success
         assert result is None
         assert error_str is not None
         assert "TimeoutError" in error_str
+        assert eval_output == ""
 
     def test_missing_function_returns_none(self, sandbox):
         program = "def other_func(data):\n    return 1, True\n"
-        result, success, error_str = sandbox.run(program, {}, 5)
+        result, success, error_str, eval_output = sandbox.run(program, {}, 5)
         assert not success
         assert result is None
         assert error_str is not None
 
     def test_exception_in_code_returns_none(self, sandbox):
         program = "def evaluate(data):\n    raise ValueError('boom')\n"
-        result, success, error_str = sandbox.run(program, {}, 5)
+        result, success, error_str, eval_output = sandbox.run(program, {}, 5)
         assert not success
         assert result is None
         assert error_str is not None
         assert "ValueError" in error_str
+
+    def test_captures_stdout_from_eval_code(self, sandbox):
+        program = "def evaluate(data):\n    print('hello from eval')\n    return (-1.0, None)\n"
+        result, success, error_str, eval_output = sandbox.run(program, {}, 10)
+        assert success
+        assert "hello from eval" in eval_output
+
+    def test_captures_stderr_from_eval_code(self, sandbox):
+        program = (
+            "import sys\n"
+            "def evaluate(data):\n"
+            "    print('stderr msg', file=sys.stderr)\n"
+            "    return (-1.0, None)\n"
+        )
+        result, success, error_str, eval_output = sandbox.run(program, {}, 10)
+        assert success
+        assert "stderr msg" in eval_output
+
+    def test_eval_output_empty_when_no_prints(self, sandbox):
+        program = "def evaluate(data):\n    return (-1.0, None)\n"
+        result, success, error_str, eval_output = sandbox.run(program, {}, 10)
+        assert success
+        assert eval_output == ""
+
+    def test_eval_output_on_timeout(self, sandbox):
+        program = "import time\ndef evaluate(data):\n    time.sleep(100)\n    return None\n"
+        result, success, error_str, eval_output = sandbox.run(program, {}, 1)
+        assert not success
+        assert eval_output == ""
 
 
 class TestEvaluator:

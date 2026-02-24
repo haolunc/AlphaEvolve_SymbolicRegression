@@ -107,6 +107,7 @@ class EvaluatedProgram:
     token_cost: float | None = None
     error_type: str | None = None
     error_message: str | None = None
+    eval_output: str | None = None
 
     # -- Convenience proxies so callers don't always need ``.parsed`` ------
 

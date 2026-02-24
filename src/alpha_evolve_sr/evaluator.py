@@ -18,8 +18,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import multiprocessing as mp
+import os
+import sys
+import tempfile
 import time
 from typing import Any
 
@@ -49,30 +53,78 @@ def _sample_to_program(
     return new_func, program
 
 
+@contextlib.contextmanager
+def _capture_fd_output():
+    """Capture all stdout/stderr at the OS fd level.
+
+    This catches output from C extensions (e.g. CMA-ES ``disp()``, BFGS)
+    that bypass Python's ``sys.stdout``/``sys.stderr``.
+
+    Yields a callable that returns the captured text so far.
+    """
+    # Save original fds and Python streams
+    saved_fd1 = os.dup(1)
+    saved_fd2 = os.dup(2)
+    saved_stdout = sys.stdout
+    saved_stderr = sys.stderr
+
+    tmp = tempfile.TemporaryFile(mode="w+b")
+    try:
+        # Redirect OS-level fds to the temp file
+        os.dup2(tmp.fileno(), 1)
+        os.dup2(tmp.fileno(), 2)
+        # Redirect Python streams to match
+        sys.stdout = os.fdopen(os.dup(tmp.fileno()), "w", closefd=True)
+        sys.stderr = os.fdopen(os.dup(tmp.fileno()), "w", closefd=True)
+
+        def _get_captured() -> str:
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.fsync(1)
+            os.fsync(2)
+            tmp.seek(0)
+            return tmp.read().decode("utf-8", errors="replace")
+
+        yield _get_captured
+    finally:
+        # Restore OS-level fds
+        sys.stdout.close()
+        sys.stderr.close()
+        os.dup2(saved_fd1, 1)
+        os.dup2(saved_fd2, 2)
+        os.close(saved_fd1)
+        os.close(saved_fd2)
+        sys.stdout = saved_stdout
+        sys.stderr = saved_stderr
+        tmp.close()
+
+
 def _execute_in_subprocess(
     program: str, data_dict: dict,
-) -> tuple[Any, bool, str | None]:
+) -> tuple[Any, bool, str | None, str]:
     """Execute untrusted code in a subprocess and return the result.
 
     Returns:
-        (result, success, error_str) — *error_str* is ``None`` on success.
+        (result, success, error_str, eval_output) — *error_str* is ``None``
+        on success. *eval_output* contains captured stdout/stderr text.
     """
     try:
-        namespace: dict = {}
-        exec(program, namespace)
+        with _capture_fd_output() as get_captured:
+            namespace: dict = {}
+            exec(program, namespace)
 
-        if "evaluate" not in namespace:
-            error_str = "NameError: 'evaluate' function not defined in program"
-            return None, False, error_str
+            if "evaluate" not in namespace:
+                error_str = "NameError: 'evaluate' function not defined in program"
+                return None, False, error_str, get_captured()
 
-        function = namespace["evaluate"]
-        result = function(data_dict)
+            function = namespace["evaluate"]
+            result = function(data_dict)
 
-        return result, True, None
+            return result, True, None, get_captured()
     except Exception as e:
         error_str = f"{type(e).__name__}: {e}"
         logger.error("Execution failed: %s", error_str)
-        return None, False, error_str
+        return None, False, error_str, get_captured()
 
 
 class Sandbox:
@@ -109,11 +161,12 @@ class Sandbox:
         program: str,
         data_dict: dict,
         timeout_seconds: int,
-    ) -> tuple[Any, bool, str | None]:
+    ) -> tuple[Any, bool, str | None, str]:
         """Execute the ``evaluate`` function inside *program* with a timeout.
 
         Returns:
-            (result, success, error_str) — *error_str* is ``None`` on success.
+            (result, success, error_str, eval_output) — *error_str* is ``None``
+            on success. *eval_output* contains captured stdout/stderr text.
         """
         try:
             pool = self._ensure_pool()
@@ -121,15 +174,15 @@ class Sandbox:
                 _execute_in_subprocess, args=(program, data_dict)
             )
             try:
-                result, success, error_str = async_result.get(timeout=timeout_seconds)
+                result, success, error_str, eval_output = async_result.get(timeout=timeout_seconds)
                 if not success:
                     logger.warning("Sandbox execution completed but reported failure")
-                return result, success, error_str
+                return result, success, error_str, eval_output
             except mp.TimeoutError:
                 error_str = f"TimeoutError: execution exceeded {timeout_seconds}s"
                 logger.warning("Process execution timed out after %d seconds", timeout_seconds)
                 self.clean()
-                return None, False, error_str
+                return None, False, error_str, ""
         except KeyboardInterrupt:
             self.clean()
             raise
@@ -137,7 +190,7 @@ class Sandbox:
             error_str = f"SandboxError: {type(e).__name__}: {e}"
             logger.error("Sandbox execution error: %s", e)
             self.clean()
-            return None, False, error_str
+            return None, False, error_str, ""
 
 
 class Evaluator:
@@ -167,7 +220,7 @@ class Evaluator:
         )
 
         time_reset = time.time()
-        run_result, runs_ok, error_str = self._sandbox.run(
+        run_result, runs_ok, error_str, eval_output = self._sandbox.run(
             program, self._data_dict, self._config.timeout_seconds
         )
         evaluate_time = time.time() - time_reset
@@ -190,6 +243,7 @@ class Evaluator:
             evaluate_time=evaluate_time,
             error_type=error_type,
             error_message=error_message,
+            eval_output=eval_output or None,
         )
 
     def initialize(self) -> EvalResult:

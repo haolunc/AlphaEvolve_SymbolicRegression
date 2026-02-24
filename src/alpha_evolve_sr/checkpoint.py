@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS programs (
     token_cost          REAL,
     llm_response_text   TEXT,
     error_type          TEXT,
-    error_message       TEXT
+    error_message       TEXT,
+    eval_output         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS island_bins (
@@ -116,7 +117,18 @@ class CheckpointDB:
         except (sqlite3.Error, OSError) as e:
             raise OSError(f"Failed to open checkpoint DB at {db_path}: {e}") from e
         self._db_path = db_path
+        self._migrate_schema()
         logger.info("CheckpointDB opened at %s", db_path)
+
+    def _migrate_schema(self) -> None:
+        """Apply forward-only schema migrations for older databases."""
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(programs)").fetchall()
+        }
+        if "eval_output" not in cols:
+            self._conn.execute("ALTER TABLE programs ADD COLUMN eval_output TEXT")
+            logger.info("Migrated schema: added eval_output column to programs")
 
     def close(self) -> None:
         if self._conn:
@@ -163,8 +175,8 @@ class CheckpointDB:
                 score, optimized_params,
                 complexity, complexity_detail, sample_time, evaluate_time,
                 token_usage_input, token_usage_output, token_cost,
-                llm_response_text, error_type, error_message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                llm_response_text, error_type, error_message, eval_output
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 program.global_sample_nums,
                 program.parsed.name,
@@ -185,6 +197,7 @@ class CheckpointDB:
                 llm_response_text,
                 program.error_type,
                 program.error_message,
+                program.eval_output,
             ),
         )
 
@@ -292,7 +305,7 @@ class CheckpointDB:
                 score, opt_params_json,
                 complexity, complexity_detail_json, sample_time, evaluate_time,
                 token_input, token_output, token_cost, _llm_text,
-                error_type, error_message,
+                error_type, error_message, eval_output,
             ) = row
             decorators = tuple(json.loads(func_decorators_json)) if func_decorators_json else ()
             parsed = code_manipulation.ParsedFunction(
@@ -320,6 +333,7 @@ class CheckpointDB:
                 token_cost=token_cost,
                 error_type=error_type,
                 error_message=error_message,
+                eval_output=eval_output,
             )
         return programs
 

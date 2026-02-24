@@ -65,7 +65,7 @@ def make_sample_message(island_id=0):
     )
 
 
-def make_evaluated_program(gsn, score=-1.0, complexity=5):
+def make_evaluated_program(gsn, score=-1.0, complexity=5, eval_output=None):
     """Build an EvaluatedProgram for testing."""
     parsed = ParsedFunction(
         name="equation", args="x, params", body="    return params[0] * x",
@@ -81,6 +81,7 @@ def make_evaluated_program(gsn, score=-1.0, complexity=5):
         evaluate_time=0.2,
         token_usage=(10, 20),
         token_cost=0.001,
+        eval_output=eval_output,
     )
 
 

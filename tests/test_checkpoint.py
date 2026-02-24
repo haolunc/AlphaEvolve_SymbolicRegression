@@ -292,3 +292,69 @@ class TestRunConfig:
         """validate_config is a no-op when no config is stored yet."""
         # Should not raise
         checkpoint_db.validate_config(num_islands=5, complexity_bin_size=10)
+
+
+class TestEvalOutput:
+    @pytest.fixture
+    def checkpoint_db(self, tmp_path):
+        db = CheckpointDB(str(tmp_path / "test.db"))
+        yield db
+        db.close()
+
+    def test_eval_output_roundtrip(self, checkpoint_db):
+        """eval_output survives insert → load round-trip."""
+        prog = make_evaluated_program(1, eval_output="CMA-ES: iter 1\nscore=-0.5\n")
+        with checkpoint_db.transaction():
+            checkpoint_db.insert_program(prog)
+        loaded = checkpoint_db.load_programs()[1]
+        assert loaded.eval_output == "CMA-ES: iter 1\nscore=-0.5\n"
+
+    def test_eval_output_none_roundtrip(self, checkpoint_db):
+        """eval_output=None survives insert → load round-trip."""
+        prog = make_evaluated_program(1)
+        with checkpoint_db.transaction():
+            checkpoint_db.insert_program(prog)
+        loaded = checkpoint_db.load_programs()[1]
+        assert loaded.eval_output is None
+
+    def test_schema_migration_adds_eval_output(self, tmp_path):
+        """Opening a DB without eval_output column triggers migration."""
+        db_path = str(tmp_path / "old.db")
+        # Create a DB with the old schema (no eval_output column)
+        conn = sqlite3.connect(db_path)
+        conn.executescript("""\
+            CREATE TABLE programs (
+                global_sample_num   INTEGER PRIMARY KEY,
+                func_name           TEXT    NOT NULL,
+                func_args           TEXT    NOT NULL,
+                func_body           TEXT    NOT NULL,
+                func_return_type    TEXT,
+                func_docstring      TEXT,
+                func_decorators     TEXT,
+                score               REAL,
+                optimized_params    TEXT,
+                complexity          INTEGER,
+                complexity_detail   TEXT,
+                sample_time         REAL,
+                evaluate_time       REAL,
+                token_usage_input   INTEGER,
+                token_usage_output  INTEGER,
+                token_cost          REAL,
+                llm_response_text   TEXT,
+                error_type          TEXT,
+                error_message       TEXT
+            );
+        """)
+        conn.execute(
+            "INSERT INTO programs VALUES (1,'f','x','    return x',NULL,NULL,NULL,"
+            "-1.0,NULL,5,NULL,0.1,0.2,10,20,0.001,NULL,NULL,NULL)"
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with CheckpointDB — migration should add eval_output
+        db = CheckpointDB(db_path)
+        loaded = db.load_programs()
+        assert 1 in loaded
+        assert loaded[1].eval_output is None
+        db.close()

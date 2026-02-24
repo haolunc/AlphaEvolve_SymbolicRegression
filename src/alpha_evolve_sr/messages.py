@@ -63,5 +63,6 @@ class EvalResult:
     complexity_detail: dict | None = None
     error_type: str | None = None
     error_message: str | None = None
+    eval_output: str | None = None
 
 
