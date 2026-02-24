@@ -11,10 +11,21 @@ import numpy as np
 
 from . import code_manipulation
 from .config import RunConfig
-from .exceptions import CheckpointError
 from .logging_config import get_logger
 
 logger = get_logger("checkpoint")
+
+
+def _score_to_db(score: float | None) -> float | None:
+    """Convert ``-inf`` to ``NULL`` for SQLite storage."""
+    if score is None or score == float("-inf"):
+        return None
+    return score
+
+
+def _score_from_db(val: float | None) -> float:
+    """Convert ``NULL`` back to ``-inf`` when loading from SQLite."""
+    return val if val is not None else float("-inf")
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +44,7 @@ CREATE TABLE IF NOT EXISTS programs (
     func_body           TEXT    NOT NULL,
     func_return_type    TEXT,
     func_docstring      TEXT,
+    func_decorators     TEXT,
     score               REAL,
     optimized_params    TEXT,
     complexity          INTEGER,
@@ -42,7 +54,9 @@ CREATE TABLE IF NOT EXISTS programs (
     token_usage_input   INTEGER,
     token_usage_output  INTEGER,
     token_cost          REAL,
-    llm_response_text   TEXT
+    llm_response_text   TEXT,
+    error_type          TEXT,
+    error_message       TEXT
 );
 
 CREATE TABLE IF NOT EXISTS island_bins (
@@ -100,7 +114,7 @@ class CheckpointDB:
             self._conn.execute("PRAGMA synchronous = NORMAL")
             self._conn.execute("PRAGMA foreign_keys = ON")
         except (sqlite3.Error, OSError) as e:
-            raise CheckpointError(f"Failed to open checkpoint DB at {db_path}: {e}") from e
+            raise OSError(f"Failed to open checkpoint DB at {db_path}: {e}") from e
         self._db_path = db_path
         logger.info("CheckpointDB opened at %s", db_path)
 
@@ -140,14 +154,17 @@ class CheckpointDB:
         if program.complexity_detail is not None:
             complexity_detail = json.dumps(program.complexity_detail)
 
+        func_decorators_json = json.dumps(list(program.parsed.decorators)) if program.parsed.decorators else None
+
         self._conn.execute(
             """INSERT OR REPLACE INTO programs (
                 global_sample_num, func_name, func_args, func_body,
-                func_return_type, func_docstring, score, optimized_params,
+                func_return_type, func_docstring, func_decorators,
+                score, optimized_params,
                 complexity, complexity_detail, sample_time, evaluate_time,
                 token_usage_input, token_usage_output, token_cost,
-                llm_response_text
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                llm_response_text, error_type, error_message
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 program.global_sample_nums,
                 program.parsed.name,
@@ -155,6 +172,7 @@ class CheckpointDB:
                 program.parsed.body,
                 program.parsed.return_type,
                 program.parsed.docstring,
+                func_decorators_json,
                 program.score,
                 opt_params,
                 program.complexity,
@@ -165,6 +183,8 @@ class CheckpointDB:
                 token_output,
                 program.token_cost,
                 llm_response_text,
+                program.error_type,
+                program.error_message,
             ),
         )
 
@@ -205,7 +225,6 @@ class CheckpointDB:
         tot_evaluate_time: float,
         tot_token_cost: float,
     ) -> None:
-        best_score_val = best_score if (best_score is not None and best_score != float("-inf")) else None
         self._conn.execute(
             """INSERT OR REPLACE INTO global_stats (
                 id, global_sample_num, last_reset_step, best_score,
@@ -213,7 +232,7 @@ class CheckpointDB:
                 tot_sample_time, tot_evaluate_time, tot_token_cost
             ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                global_sample_num, last_reset_step, best_score_val,
+                global_sample_num, last_reset_step, _score_to_db(best_score),
                 success_count, failed_count,
                 tot_sample_time, tot_evaluate_time, tot_token_cost,
             ),
@@ -230,11 +249,10 @@ class CheckpointDB:
         """
         self._conn.execute("DELETE FROM island_stats")
         for island_id, size, best_score, best_gsn in island_stats:
-            best_score_val = best_score if (best_score is not None and best_score != float("-inf")) else None
             self._conn.execute(
                 "INSERT INTO island_stats (island_id, size, best_score, best_gsn)"
                 " VALUES (?, ?, ?, ?)",
-                (island_id, size, best_score_val, best_gsn),
+                (island_id, size, _score_to_db(best_score), best_gsn),
             )
 
     def save_run_config(
@@ -270,16 +288,20 @@ class CheckpointDB:
         for row in rows:
             (
                 gsn, func_name, func_args, func_body,
-                func_return_type, func_docstring, score, opt_params_json,
+                func_return_type, func_docstring, func_decorators_json,
+                score, opt_params_json,
                 complexity, complexity_detail_json, sample_time, evaluate_time,
                 token_input, token_output, token_cost, _llm_text,
+                error_type, error_message,
             ) = row
+            decorators = tuple(json.loads(func_decorators_json)) if func_decorators_json else ()
             parsed = code_manipulation.ParsedFunction(
                 name=func_name,
                 args=func_args,
                 body=func_body,
                 return_type=func_return_type,
                 docstring=func_docstring,
+                decorators=decorators,
             )
             opt_params = json.loads(opt_params_json) if opt_params_json else None
             complexity_detail = json.loads(complexity_detail_json) if complexity_detail_json else None
@@ -296,6 +318,8 @@ class CheckpointDB:
                 evaluate_time=evaluate_time,
                 token_usage=token_usage,
                 token_cost=token_cost,
+                error_type=error_type,
+                error_message=error_message,
             )
         return programs
 
@@ -352,7 +376,7 @@ class CheckpointDB:
         return {
             "global_sample_num": row[0],
             "last_reset_step": row[1],
-            "best_score": row[2] if row[2] is not None else float("-inf"),
+            "best_score": _score_from_db(row[2]),
             "success_count": row[3],
             "failed_count": row[4],
             "tot_sample_time": row[5],
@@ -370,7 +394,7 @@ class CheckpointDB:
             {
                 "island_id": r[0],
                 "size": r[1],
-                "best_score": r[2] if r[2] is not None else float("-inf"),
+                "best_score": _score_from_db(r[2]),
                 "best_gsn": r[3],
             }
             for r in rows
@@ -394,19 +418,19 @@ class CheckpointDB:
         """Validate that structural config matches stored checkpoint.
 
         Raises:
-            CheckpointError: if num_islands or complexity_bin_size differ.
+            ValueError: if num_islands or complexity_bin_size differ.
         """
         stored = self.load_run_config()
         if stored is None:
             return  # No stored config to validate against
         if stored["num_islands"] != num_islands:
-            raise CheckpointError(
+            raise ValueError(
                 f"Config mismatch on resume: num_islands={num_islands} "
                 f"but checkpoint has num_islands={stored['num_islands']}. "
                 f"Changing num_islands mid-run is not supported."
             )
         if stored["complexity_bin_size"] != complexity_bin_size:
-            raise CheckpointError(
+            raise ValueError(
                 f"Config mismatch on resume: complexity_bin_size={complexity_bin_size} "
                 f"but checkpoint has complexity_bin_size={stored['complexity_bin_size']}. "
                 f"Changing complexity_bin_size mid-run is not supported."

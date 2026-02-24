@@ -40,17 +40,17 @@ pip install -e ".[examples]"
 ```
 src/alpha_evolve_sr/
 ├── __init__.py          # Package exports
-├── cli.py               # CLI entry point (was main_distributed.py)
+├── cli.py               # CLI entry point and unified pipeline
 ├── config.py            # Configuration dataclasses
-├── database.py          # Program database with island-based evolutionary algorithm (was programs_database.py)
+├── database.py          # Program database with island-based evolutionary algorithm
 ├── sampler.py           # LLM provider interface and sampling
-├── evaluator.py         # Sandbox execution and parameter optimization
-├── profiler.py          # TensorBoard logging for database status
-├── checkpoint.py        # Checkpoint saving/loading (was checkpoint_util.py)
+├── evaluator.py         # Sandbox execution and mp.Pool worker functions
+├── profiler.py          # TensorBoard logging for pipeline metrics
+├── checkpoint.py        # SQLite checkpoint saving/loading
 ├── code_manipulation.py # Python code parsing; core data classes for evolution
-├── complexity.py        # Equation complexity calculation (was equ_comp.py)
-├── workers.py           # Distributed worker processes (was distribution_util.py)
-├── logging_config.py    # Unified logging configuration (was logging_utils.py)
+├── complexity.py        # Equation complexity calculation
+├── logging_config.py    # Unified logging configuration
+├── messages.py          # Pipeline message dataclasses
 └── exceptions.py        # Custom exception hierarchy
 tests/
 ├── test_code_manipulation.py

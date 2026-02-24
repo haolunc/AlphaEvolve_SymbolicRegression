@@ -221,9 +221,7 @@ class ProgramsDatabase:
         self._tot_sample_time: float = 0.0
         self._tot_evaluate_time: float = 0.0
         self._tot_token_cost: float = 0.0
-        self._tb_writer = profiler.TensorBoardWriter(
-            log_dir, log_frequency=config.log_frequency,
-        )
+        self._tb_writer = profiler.TensorBoardWriter(log_dir)
         self._global_sample_nums = 0
 
         # Pareto front: lightweight entries sorted by cbin
@@ -237,6 +235,11 @@ class ProgramsDatabase:
             self._checkpoint_db = checkpoint_db
         self._max_samples = max_samples
         self._steps_since_checkpoint = 0
+
+        # Transient pipeline stats (not checkpointed)
+        self._pending_evals: int | None = None
+        self._pending_samplers: int | None = None
+        self._wall_time_seconds: float | None = None
 
     @property
     def sample_count(self) -> int:
@@ -252,6 +255,21 @@ class ProgramsDatabase:
     def should_stop(self) -> bool:
         """Whether the maximum number of samples has been reached."""
         return self._global_sample_nums >= self._max_samples
+
+    def update_pipeline_stats(
+        self,
+        *,
+        pending_evals: int | None = None,
+        pending_samplers: int | None = None,
+        wall_time_seconds: float | None = None,
+    ) -> None:
+        """Update transient pipeline statistics for profiling."""
+        if pending_evals is not None:
+            self._pending_evals = pending_evals
+        if pending_samplers is not None:
+            self._pending_samplers = pending_samplers
+        if wall_time_seconds is not None:
+            self._wall_time_seconds = wall_time_seconds
 
     # ------------------------------------------------------------------
     # Lifecycle (absorbed from EvolutionController)
@@ -490,13 +508,15 @@ class ProgramsDatabase:
             parsed=eval_result.function,
             score=ex.score if ex else None,
             optimized_params=ex.optimized_params if ex else None,
-            complexity=ex.complexity if ex else None,
-            complexity_detail=ex.complexity_detail if ex else None,
+            complexity=eval_result.complexity,
+            complexity_detail=eval_result.complexity_detail,
             global_sample_nums=self._global_sample_nums,
             sample_time=sample_time,
             evaluate_time=eval_result.evaluate_time,
             token_usage=sample_token_usage,
             token_cost=cost,
+            error_type=eval_result.error_type,
+            error_message=eval_result.error_message,
         )
 
         with self._checkpoint_db.transaction():
@@ -530,13 +550,8 @@ class ProgramsDatabase:
             self._update_pareto_front(evaluated)
 
         self._update_profiling_stats(evaluated)
-        logger.info(
-            "Evaluated Function: score=%s complexity=%s sample_order=%s",
-            evaluated.score,
-            evaluated.complexity,
-            evaluated.global_sample_nums,
-        )
-        self._tb_writer.write(self._build_profile_metrics())
+        if self._global_sample_nums % self._config.log_frequency == 0:
+            self._tb_writer.write(self._build_profile_metrics())
 
         # Periodic checkpoint of all derived data
         self._steps_since_checkpoint += 1
@@ -606,6 +621,9 @@ class ProgramsDatabase:
             pareto_front=self._pareto_front,
             best_score_per_island=self._best_score_per_island,
             island_sizes=[isl.num_programs for isl in self._islands],
+            pending_evals=self._pending_evals,
+            pending_samplers=self._pending_samplers,
+            wall_time_seconds=self._wall_time_seconds,
         )
 
     def _update_pareto_front(self, program: code_manipulation.EvaluatedProgram) -> None:
@@ -647,12 +665,11 @@ class ProgramsDatabase:
             self._islands[island_id].clear()
             founder_island_id = np.random.choice(keep_islands_ids)
             founder = self._best_program_per_island[founder_island_id]
-            # founder is (gsn, score, complexity)
-            self._islands[island_id].register(founder[0], founder[1], founder[2])
-            # Update cached best
-            self._best_score_per_island[island_id] = founder[1]
+            gsn, score, complexity = founder
+            self._islands[island_id].register(gsn, score, complexity)
+            self._best_score_per_island[island_id] = score
             self._best_program_per_island[island_id] = founder
-            logger.info("Reset island %d with founder %d", island_id, founder[0])
+            logger.info("Reset island %d with founder %d", island_id, gsn)
         # Force checkpoint after reset
         self._checkpoint_derived()
         self._steps_since_checkpoint = 0

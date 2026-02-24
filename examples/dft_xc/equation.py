@@ -1,3 +1,4 @@
+@jax.jit
 def equation(rho: jnp.ndarray, s: jnp.ndarray, params: jnp.ndarray) -> jnp.ndarray:
     """Computes exchange-correlation energy density (e_xc) using PBE exchange without correlation.
 

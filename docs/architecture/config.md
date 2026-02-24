@@ -15,11 +15,11 @@ All configuration lives in a single YAML file, parsed by `RunConfig.from_yaml()`
 run_config = RunConfig.from_yaml("my_config.yaml")
 ```
 
-The YAML file has top-level scalar fields plus nested sections (`sampler`, `database`, `evaluator`, `profiler`, `worker`) that map to frozen dataclasses. Unknown keys in nested sections are warned and ignored; unknown top-level keys raise `ValueError`.
+The YAML file has top-level scalar fields plus nested sections (`sampler`, `database`, `evaluator`) that map to frozen dataclasses. Unknown keys in nested sections are warned and ignored; unknown top-level keys raise `ValueError`.
 
-> **Note:** `RunConfig` is the only mutable config dataclass. The CLI
-> sets `log_path` and `save_ckpt_dir` after construction, and may
-> override `resume_from_ckpt` from command-line arguments.
+> **Backward compatibility:** The deprecated keys `distributed` and `worker` are silently ignored with a `DeprecationWarning`.
+
+> **Note:** `RunConfig` is the only mutable config dataclass. `__post_init__` normalizes `resume_from_ckpt` and defaults `save_ckpt_dir` from `log_dir`.
 
 ---
 
@@ -41,15 +41,12 @@ Top-level pipeline configuration.
 |-------|------|---------|-------------|
 | `problem_dir` | `str \| None` | `None` | Path to the problem directory (prompt.txt, equation.py, evaluate.py) |
 | `data_folder` | `str \| None` | `None` | Path to the training data directory (train.csv) |
-| `log_folder` | `str \| None` | `None` | Base name for the log directory |
-| `log_path` | `str \| None` | `None` | Full path to log directory (derived from `log_folder` by CLI) |
-| `problem_name` | `str` | `"oscillator1"` | Human-readable problem identifier |
+| `log_dir` | `str \| None` | `None` | Path to the log directory |
 | `max_samples` | `int` | `3600` | Stop after this many total evaluations |
-| `distributed` | `bool` | `True` | Use multiprocessing (distributed mode) |
-| `num_samplers` | `int` | `8` | Number of sampler worker processes |
+| `num_samplers` | `int` | `8` | Number of concurrent LLM sampler threads |
 | `num_evaluators` | `int` | `8` | Number of evaluator worker processes |
-| `save_ckpt_dir` | `str \| None` | `None` | Directory for checkpoints (derived from `log_folder` by CLI) |
-| `resume_from_ckpt` | `str \| None` | `None` | Path to a checkpoint directory to resume from |
+| `save_ckpt_dir` | `str \| None` | `None` | Directory for checkpoints (defaults to `log_dir`) |
+| `resume_from_ckpt` | `str \| None` | `None` | Path to a checkpoint file or directory to resume from |
 
 Nested configs (each described below):
 
@@ -58,8 +55,6 @@ Nested configs (each described below):
 | `sampler` | `SamplerConfig` |
 | `database` | `ProgramsDatabaseConfig` |
 | `evaluator` | `EvaluatorConfig` |
-| `profiler` | `ProfilerConfig` |
-| `worker` | `WorkerConfig` |
 
 ---
 
@@ -78,6 +73,7 @@ Evolutionary algorithm parameters.
 | `cluster_max_size` | `int` | `100` | Maximum programs per cluster before pruning |
 | `pareto_aware` | `bool` | `False` | Weight cluster selection by Pareto improvement potential |
 | `checkpoint_interval` | `int` | `10` | Save checkpoint every N registered programs |
+| `log_frequency` | `int` | `25` | Write detailed TensorBoard logs every N samples |
 
 ---
 
@@ -93,7 +89,7 @@ LLM request parameters.
 | `max_retries` | `int` | `5` | Maximum retry attempts per request |
 | `retry_delay_seconds` | `float` | `5.0` | Delay between retries |
 | `request_timeout_seconds` | `int` | `180` | Timeout for a single LLM request |
-| `samples_per_prompt` | `int` | `1` | Number of completions to draw per prompt |
+| `samples_per_prompt` | `int` | `1` | Number of completions to draw per prompt (sequential) |
 | `cost_per_ktoken` | `list[float]` | `[0.006, 0.024]` | Cost per 1K tokens `[input, output]` for tracking |
 
 ---
@@ -105,24 +101,3 @@ Sandbox execution parameters.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `timeout_seconds` | `int` | `400` | Maximum time (seconds) for a single sandbox evaluation |
-
----
-
-### ProfilerConfig
-
-Logging and metrics parameters.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `log_frequency` | `int` | `100` | Write detailed TensorBoard logs every N samples |
-
----
-
-### WorkerConfig
-
-Distributed worker timing.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `perf_report_interval_seconds` | `int` | `150` | How often workers report performance stats |
-| `monitor_interval_seconds` | `int` | `300` | How often the monitor prints a summary report |

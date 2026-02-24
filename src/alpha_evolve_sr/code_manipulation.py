@@ -30,34 +30,8 @@ import dataclasses
 import io
 import logging
 import re
-import tokenize
-from collections.abc import Iterator, MutableSet, Sequence
 
 logger = logging.getLogger(__name__)
-
-
-def yield_decorated(code: str, module: str, name: str) -> Iterator[str]:
-    """Yields names of functions whose preceding comment contains ``@module.name``.
-
-    Looks for comment-style markers like ``# @evaluate.run`` on the line
-    immediately before a function definition.
-    """
-    lines = code.splitlines()
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("def "):
-            # Check the preceding non-blank line for a comment marker
-            for j in range(i - 1, -1, -1):
-                prev = lines[j].strip()
-                if not prev:
-                    continue
-                pattern = rf"#\s*@{re.escape(module)}\.{re.escape(name)}"
-                if re.search(pattern, prev):
-                    # Extract function name
-                    match = re.match(r"def\s+(\w+)\s*\(", stripped)
-                    if match:
-                        yield match.group(1)
-                break
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +47,7 @@ class ParsedFunction:
     body: str
     return_type: str | None = None
     docstring: str | None = None
+    decorators: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         # Sanitize body: strip leading/trailing newlines.
@@ -84,9 +59,13 @@ class ParsedFunction:
             object.__setattr__(self, "docstring", cleaned)
 
     def __str__(self) -> str:
+        result = ""
+        for dec in self.decorators:
+            result += f"@{dec}\n"
+
         return_type = f" -> {self.return_type}" if self.return_type else ""
 
-        function = f"def {self.name}({self.args}){return_type}:\n"
+        function = result + f"def {self.name}({self.args}){return_type}:\n"
         if self.docstring:
             new_line = "\n" if self.body else ""
             function += f'    """{self.docstring}"""{new_line}'
@@ -126,6 +105,8 @@ class EvaluatedProgram:
     evaluate_time: float | None = None
     token_usage: tuple[int, int] | None = None
     token_cost: float | None = None
+    error_type: str | None = None
+    error_message: str | None = None
 
     # -- Convenience proxies so callers don't always need ``.parsed`` ------
 
@@ -208,16 +189,7 @@ class ProgramVisitor(ast.NodeVisitor):
                         self._codelines[: decorator_start_line - 1]
                     )
                 else:
-                    # Check for comment-style decorator markers above the def
-                    start_line = node.lineno - 1
-                    for j in range(start_line - 1, -1, -1):
-                        stripped = self._codelines[j].strip()
-                        if stripped.startswith("#") and "@" in stripped:
-                            start_line = j
-                            break
-                        if stripped:
-                            break
-                    self._preface = "\n".join(self._codelines[:start_line])
+                    self._preface = "\n".join(self._codelines[:node.lineno - 1])
 
             function_end_line = node.end_lineno
             body_start_line = node.body[0].lineno - 1
@@ -232,6 +204,8 @@ class ProgramVisitor(ast.NodeVisitor):
                 else:
                     body_start_line = function_end_line
 
+            decorators = tuple(ast.unparse(d) for d in node.decorator_list)
+
             self._functions.append(
                 ParsedFunction(
                     name=node.name,
@@ -239,6 +213,7 @@ class ProgramVisitor(ast.NodeVisitor):
                     return_type=ast.unparse(node.returns) if node.returns else None,
                     docstring=docstring,
                     body="\n".join(self._codelines[body_start_line:function_end_line]),
+                    decorators=decorators,
                 )
             )
         self.generic_visit(node)
@@ -255,9 +230,9 @@ def text_to_program(text: str) -> Program:
         visitor = ProgramVisitor(text)
         visitor.visit(tree)
         return visitor.return_program()
-    except Exception as e:
+    except Exception:
         logger.warning("Failed parsing %s", text)
-        raise e
+        raise
 
 
 def text_to_function(text: str) -> ParsedFunction:
@@ -271,70 +246,12 @@ def text_to_function(text: str) -> ParsedFunction:
     return program.functions[0]
 
 
-def _tokenize(code: str) -> Iterator[tokenize.TokenInfo]:
-    """Transforms ``code`` into Python tokens."""
-    code_bytes = code.encode()
-    code_io = io.BytesIO(code_bytes)
-    return tokenize.tokenize(code_io.readline)
-
-
-def _untokenize(tokens: Sequence[tokenize.TokenInfo]) -> str:
-    """Transforms a list of Python tokens into code."""
-    code_bytes = tokenize.untokenize(tokens)
-    return code_bytes.decode()
-
-
-def _yield_token_and_is_call(code: str) -> Iterator[tuple[tokenize.TokenInfo, bool]]:
-    """Yields each token with a bool indicating whether it is a function call."""
-    try:
-        tokens = _tokenize(code)
-        prev_token = None
-        is_attribute_access = False
-        for token in tokens:
-            if (
-                prev_token
-                and prev_token.type == tokenize.NAME
-                and token.type == tokenize.OP
-                and token.string == "("
-            ):
-                yield prev_token, not is_attribute_access
-                is_attribute_access = False
-            else:
-                if prev_token:
-                    is_attribute_access = (
-                        prev_token.type == tokenize.OP and prev_token.string == "."
-                    )
-                    yield prev_token, False
-            prev_token = token
-        if prev_token:
-            yield prev_token, False
-    except Exception as e:
-        logger.warning("Failed parsing %s", code)
-        raise e
-
-
 def rename_function_calls(code: str, source_name: str, target_name: str) -> str:
     """Renames function calls from ``source_name`` to ``target_name``."""
     if source_name not in code:
         return code
-    modified_tokens = []
-    for token, is_call in _yield_token_and_is_call(code):
-        if is_call and token.string == source_name:
-            modified_token = tokenize.TokenInfo(
-                type=token.type,
-                string=target_name,
-                start=token.start,
-                end=token.end,
-                line=token.line,
-            )
-            modified_tokens.append(modified_token)
-        else:
-            modified_tokens.append(token)
-    return _untokenize(modified_tokens)
-
-
-def get_functions_called(code: str) -> MutableSet[str]:
-    """Returns the set of all functions called in ``code``."""
-    return set(
-        token.string for token, is_call in _yield_token_and_is_call(code) if is_call
+    return re.sub(
+        rf"(?<!\.)\b{re.escape(source_name)}(?=\s*\()",
+        target_name,
+        code,
     )

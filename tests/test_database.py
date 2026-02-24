@@ -1,36 +1,21 @@
 """Tests for the programs database."""
 
+import dataclasses
+
+import numpy as np
 import pytest
 
-from alpha_evolve_sr.code_manipulation import EvaluatedProgram, ParsedFunction
+from alpha_evolve_sr.code_manipulation import ParsedFunction
 from alpha_evolve_sr.config import ProgramsDatabaseConfig
-from alpha_evolve_sr.database import Island, ParetoEntry
-from alpha_evolve_sr.messages import EvalResult, ExecutionResult, LLMResponse, SampleMessage
-from tests.conftest import SAMPLE_PROMPT, SAMPLE_SEED_FUNCTION
+from alpha_evolve_sr.database import Island, ParetoEntry, _softmax
+from tests.conftest import SAMPLE_PROMPT, SAMPLE_SEED_FUNCTION, make_eval_result, make_sample_message
 
 
 def _make_result(function, island_id=None, score=-1.0, complexity=5):
     """Build an (EvalResult, SampleMessage | None) pair for testing."""
-    eval_result = EvalResult(
-        function=function,
-        execution_result=ExecutionResult(
-            score=score, optimized_params=None,
-            complexity=complexity, complexity_detail={},
-        ),
-        evaluate_time=0.1,
-    )
-    sample_msg = None
-    if island_id is not None:
-        sample_msg = SampleMessage(
-            llm_response=LLMResponse(
-                response_text="return x",
-                input_tokens=10,
-                output_tokens=20,
-                token_cost=0.001,
-            ),
-            island_id=island_id,
-            sample_time=0.1,
-        )
+    eval_result = make_eval_result(score=score)
+    eval_result = dataclasses.replace(eval_result, function=function, complexity=complexity)
+    sample_msg = make_sample_message(island_id=island_id) if island_id is not None else None
     return eval_result, sample_msg
 
 
@@ -51,6 +36,35 @@ def db(tmp_path):
 
     database.register_program(*_make_result(SAMPLE_SEED_FUNCTION, island_id=None, score=-1.0, complexity=5))
     return database
+
+
+class TestSoftmax:
+    """Invariant / property tests for the _softmax helper."""
+
+    def test_probabilities_sum_to_one(self):
+        """Output is a valid probability distribution."""
+        for logits in [np.array([1.0, 2.0, 3.0]), np.array([0.0, 0.0]), np.array([-100.0, 100.0])]:
+            probs = _softmax(logits, temperature=1.0)
+            assert abs(probs.sum() - 1.0) < 1e-9
+            assert np.all(probs >= 0)
+
+    def test_high_temperature_approaches_uniform(self):
+        logits = np.array([1.0, 2.0, 3.0])
+        probs = _softmax(logits, temperature=100.0)
+        assert np.allclose(probs, 1 / 3, atol=0.05)
+
+    def test_low_temperature_concentrates(self):
+        logits = np.array([1.0, 2.0, 3.0])
+        probs = _softmax(logits, temperature=0.01)
+        assert probs[2] > 0.99  # max logit gets ~all weight
+
+    def test_non_finite_raises(self):
+        with pytest.raises(ValueError, match="non-finite"):
+            _softmax(np.array([1.0, float("inf")]), temperature=1.0)
+
+    def test_single_element(self):
+        probs = _softmax(np.array([42.0]), temperature=1.0)
+        assert np.allclose(probs, [1.0])
 
 
 class TestProgramsDatabase:
@@ -172,6 +186,20 @@ class TestParetoFront:
 
 class TestParetoWeights:
     """Tests for Island._pareto_weights() with non-front bins."""
+
+    def test_weights_sum_to_one(self):
+        """Weights must form a valid probability distribution."""
+        island = Island(functions_per_prompt=2, complexity_bin_size=1, cluster_max_size=10)
+        for c, s in [(1, 0.2), (3, 0.5), (7, 0.9)]:
+            island.register(gsn=c, score=s, complexity=c)
+        pareto_front = [
+            ParetoEntry(cbin=1, score=0.8, gsn=10),
+            ParetoEntry(cbin=7, score=1.0, gsn=11),
+        ]
+        bins = list(island._bins.keys())
+        weights = island._pareto_weights(bins, pareto_front)
+        assert abs(weights.sum() - 1.0) < 1e-9
+        assert np.all(weights >= 0)
 
     def test_non_front_bin_uses_nearest_pareto_entry(self):
         """A bin not on the Pareto front gets a weight based on the nearest Pareto cbin."""

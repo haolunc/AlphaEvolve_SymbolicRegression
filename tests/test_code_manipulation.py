@@ -6,42 +6,10 @@ import pytest
 
 from alpha_evolve_sr.code_manipulation import (
     ParsedFunction,
-    get_functions_called,
     rename_function_calls,
     text_to_function,
     text_to_program,
-    yield_decorated,
 )
-
-
-class TestYieldDecorated:
-    """Tests for the comment-marker decorator parser."""
-
-    def test_finds_evaluate_run(self):
-        code = "# @evaluate.run\ndef evaluate(data):\n    pass\n"
-        result = list(yield_decorated(code, "evaluate", "run"))
-        assert result == ["evaluate"]
-
-    def test_finds_equation_evolve(self):
-        code = "# @equation.evolve\ndef equation(x, params):\n    return x\n"
-        result = list(yield_decorated(code, "equation", "evolve"))
-        assert result == ["equation"]
-
-    def test_no_match(self):
-        code = "def foo(x):\n    return x\n"
-        result = list(yield_decorated(code, "evaluate", "run"))
-        assert result == []
-
-    def test_ignores_wrong_marker(self):
-        code = "# @other.marker\ndef foo(x):\n    pass\n"
-        result = list(yield_decorated(code, "evaluate", "run"))
-        assert result == []
-
-    def test_blank_line_between_marker_and_def(self):
-        code = "# @evaluate.run\n\ndef evaluate(data):\n    pass\n"
-        # The marker must be on the immediately preceding non-blank line
-        result = list(yield_decorated(code, "evaluate", "run"))
-        assert result == ["evaluate"]
 
 
 class TestTextToFunction:
@@ -135,11 +103,55 @@ class TestParsedFunctionSanitisation:
         assert fn2.name == "g"
 
 
-class TestGetFunctionsCalled:
-    """Tests for extracting called function names."""
+class TestDecoratorSupport:
+    """Tests for ParsedFunction decorator parsing and round-tripping."""
 
-    def test_finds_calls(self):
-        code = "def foo():\n    bar()\n    baz(1)\n"
-        called = get_functions_called(code)
-        assert "bar" in called
-        assert "baz" in called
+    def test_parse_single_decorator(self):
+        code = "@jax.jit\ndef foo(x):\n    return x\n"
+        fn = text_to_function(code)
+        assert fn.decorators == ("jax.jit",)
+
+    def test_parse_multiple_decorators(self):
+        code = "@decorator_a\n@decorator_b(arg=1)\ndef foo(x):\n    return x\n"
+        fn = text_to_function(code)
+        assert fn.decorators == ("decorator_a", "decorator_b(arg=1)")
+
+    def test_parse_no_decorators(self):
+        code = "def foo(x):\n    return x\n"
+        fn = text_to_function(code)
+        assert fn.decorators == ()
+
+    def test_str_roundtrip(self):
+        code = "@jax.jit\ndef foo(x):\n    return x\n"
+        fn = text_to_function(code)
+        reparsed = text_to_function(str(fn))
+        assert reparsed.decorators == ("jax.jit",)
+        assert reparsed.name == "foo"
+        assert "return x" in reparsed.body
+
+    def test_str_emits_decorator_lines(self):
+        fn = ParsedFunction(
+            name="f", args="x", body="    return x",
+            decorators=("jax.jit", "functools.wraps(g)"),
+        )
+        source = str(fn)
+        assert "@jax.jit\n" in source
+        assert "@functools.wraps(g)\n" in source
+        assert source.index("@jax.jit") < source.index("def f")
+
+    def test_dataclasses_replace_preserves_decorators(self):
+        fn = ParsedFunction(
+            name="f", args="x", body="    return x", decorators=("jax.jit",),
+        )
+        fn2 = dataclasses.replace(fn, body="    return x * 2")
+        assert fn2.decorators == ("jax.jit",)
+        assert "x * 2" in fn2.body
+
+    def test_program_with_decorated_function(self):
+        code = "import jax\n\n@jax.jit\ndef foo(x):\n    return x\n"
+        prog = text_to_program(code)
+        assert len(prog.functions) == 1
+        assert prog.functions[0].decorators == ("jax.jit",)
+        assert "import jax" in prog.preface
+
+

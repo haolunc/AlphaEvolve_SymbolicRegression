@@ -2,6 +2,8 @@
 
 import ast
 
+import pytest
+
 from alpha_evolve_sr.complexity import complexity_score
 
 
@@ -38,6 +40,18 @@ class TestComplexityScore:
         score_custom = complexity_score(code, op_weights={ast.Add: 5})
         score_default = complexity_score(code)
         assert score_custom > score_default
+
+
+class TestKnownScores:
+    """Verify exact complexity scores for simple, well-understood expressions."""
+
+    @pytest.mark.parametrize("code,expected", [
+        ("def f(x):\n    return x\n", 1),          # one Var (x)
+        ("def f(x):\n    return x + 1\n", 3),      # Var + BinOp + Const
+        ("def f(x):\n    return 42\n", 1),          # one Const
+    ])
+    def test_known_scores(self, code, expected):
+        assert complexity_score(code) == expected
 
 
 class TestNoGlobalMutation:

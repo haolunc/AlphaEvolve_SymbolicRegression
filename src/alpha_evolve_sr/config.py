@@ -20,10 +20,11 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
+import warnings
 from dataclasses import field
 
 import yaml
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -93,19 +94,6 @@ class EvaluatorConfig:
     timeout_seconds: int = 400
 
 
-@dataclasses.dataclass(frozen=True)
-class WorkerConfig:
-    """Configuration for distributed worker processes.
-
-    Attributes:
-      perf_report_interval_seconds: How often workers report performance stats.
-      monitor_interval_seconds: How often the monitor prints a report.
-    """
-
-    perf_report_interval_seconds: int = 150
-    monitor_interval_seconds: int = 300
-
-
 def _coerce_int_fields(dc_cls: type, data: dict) -> None:
     """Convert float values to int for fields typed as int.
 
@@ -113,7 +101,7 @@ def _coerce_int_fields(dc_cls: type, data: dict) -> None:
     ``range()`` and other int-only call sites don't crash.
     """
     int_fields = {
-        f.name for f in dataclasses.fields(dc_cls) if f.type in ("int", int)
+        f.name for f in dataclasses.fields(dc_cls) if f.type == "int"
     }
     for key in int_fields & data.keys():
         val = data[key]
@@ -137,7 +125,6 @@ class RunConfig:
 
     # Pipeline
     max_samples: int = 3600
-    distributed: bool = True
     num_samplers: int = 8
     num_evaluators: int = 8
 
@@ -149,10 +136,9 @@ class RunConfig:
     sampler: SamplerConfig = field(default_factory=SamplerConfig)
     database: ProgramsDatabaseConfig = field(default_factory=ProgramsDatabaseConfig)
     evaluator: EvaluatorConfig = field(default_factory=EvaluatorConfig)
-    worker: WorkerConfig = field(default_factory=WorkerConfig)
 
     def __post_init__(self) -> None:
-        # Normalize resume_from_ckpt: directory → checkpoint.db
+        # Normalize resume_from_ckpt: directory -> checkpoint.db
         if self.resume_from_ckpt is not None and os.path.isdir(self.resume_from_ckpt):
             self.resume_from_ckpt = os.path.join(self.resume_from_ckpt, "checkpoint.db")
 
@@ -184,7 +170,17 @@ class RunConfig:
         database_data = data.pop("database", {})
         sampler_data = data.pop("sampler", {})
         evaluator_data = data.pop("evaluator", {})
-        worker_data = data.pop("worker", {})
+
+        # Strip deprecated keys that no longer exist, with a warning.
+        _deprecated_keys = ("distributed", "worker")
+        for key in _deprecated_keys:
+            if key in data:
+                warnings.warn(
+                    f"Config key '{key}' is deprecated and will be ignored.",
+                    DeprecationWarning,
+                    stacklevel=3,
+                )
+                del data[key]
 
         # Reject unknown top-level keys (catches typos like "smpler")
         known_fields = {f.name for f in dataclasses.fields(cls)}
@@ -199,7 +195,6 @@ class RunConfig:
             SamplerConfig: sampler_data,
             ProgramsDatabaseConfig: database_data,
             EvaluatorConfig: evaluator_data,
-            WorkerConfig: worker_data,
         }
         for dc_cls, dc_data in sub_configs.items():
             # Filter unknown keys in nested configs (graceful for old YAML files)
@@ -215,7 +210,6 @@ class RunConfig:
             sampler=SamplerConfig(**sampler_data),
             database=ProgramsDatabaseConfig(**database_data),
             evaluator=EvaluatorConfig(**evaluator_data),
-            worker=WorkerConfig(**worker_data),
             **data,
         )
 

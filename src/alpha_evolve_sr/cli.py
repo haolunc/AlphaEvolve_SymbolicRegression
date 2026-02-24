@@ -1,24 +1,77 @@
-"""Entry point for the alpha_evolve_sr pipeline (distributed and non-distributed)."""
+"""Entry point for the alpha_evolve_sr pipeline."""
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import multiprocessing as mp
 import os
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import pandas as pd
 
 from . import code_manipulation
-from . import evaluator as evaluator_mod
 from . import sampler as sampler_mod
-from .config import RunConfig
+from .complexity import complexity_score
+from .config import EvaluatorConfig, RunConfig
 from .database import ProgramsDatabase
+from .evaluator import Evaluator
 from .logging_config import configure_logging, get_logger
-from .messages import SampleMessage
-from .workers import _close_queues, database_worker, evaluator_worker, monitoring_worker, sampler_worker
+from .messages import EvalResult, SampleMessage
 
 logger = get_logger("cli")
+
+
+# ---------------------------------------------------------------------------
+# Thread-local evaluator management
+# ---------------------------------------------------------------------------
+
+_eval_tls = threading.local()
+
+
+def _init_eval_thread(
+    evaluate_code: str,
+    seed_function: code_manipulation.ParsedFunction,
+    data_dict: dict,
+    config: EvaluatorConfig,
+) -> None:
+    """ThreadPoolExecutor initializer: create a persistent Evaluator per thread."""
+    _eval_tls.evaluator = Evaluator(evaluate_code, seed_function, data_dict, config=config)
+
+
+def _eval_thread_analyse(
+    sample_msg: SampleMessage,
+) -> tuple[EvalResult, SampleMessage]:
+    """Evaluate a sample in the calling thread's Evaluator."""
+    result = _eval_tls.evaluator.analyse(sample_msg)
+    return (result, sample_msg)
+
+
+def _eval_thread_initialize() -> EvalResult:
+    """Evaluate the seed function in the calling thread's Evaluator."""
+    return _eval_tls.evaluator.initialize()
+
+
+# ---------------------------------------------------------------------------
+# Complexity attachment (runs in main thread)
+# ---------------------------------------------------------------------------
+
+def _attach_complexity(eval_result: EvalResult) -> EvalResult:
+    """Compute complexity and attach it to *eval_result*."""
+    if eval_result.execution_result is None:
+        return eval_result
+    try:
+        c_val, c_detail = complexity_score(str(eval_result.function), return_breakdown=True)
+    except Exception as e:
+        c_val, c_detail = None, {}
+        return dataclasses.replace(
+            eval_result, complexity=c_val, complexity_detail=c_detail,
+            error_type=eval_result.error_type or "complexity",
+            error_message=eval_result.error_message or str(e),
+        )
+    return dataclasses.replace(eval_result, complexity=c_val, complexity_detail=c_detail)
 
 
 # ---------------------------------------------------------------------------
@@ -52,161 +105,172 @@ def load_problem(
 
 
 # ---------------------------------------------------------------------------
-# Distributed mode
+# Sampler task (submitted to ThreadPoolExecutor)
 # ---------------------------------------------------------------------------
 
-def main_distributed(
+def _sampler_task(
+    llm: sampler_mod.LLM,
+    prompt_code: str,
+    island_id: int,
+) -> SampleMessage | None:
+    """Make a single LLM call and wrap the result in a ``SampleMessage``."""
+    t0 = time.time()
+    resp = llm.query(prompt_code)
+    if resp is None:
+        return None
+    return SampleMessage(
+        llm_response=resp,
+        island_id=island_id,
+        sample_time=time.time() - t0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unified pipeline
+# ---------------------------------------------------------------------------
+
+def _cleanup_eval_threads(eval_pool: ThreadPoolExecutor) -> None:
+    """Clean up Sandbox subprocesses in all evaluator threads."""
+    futs = []
+    for _ in range(eval_pool._max_workers):
+        futs.append(eval_pool.submit(lambda: _eval_tls.evaluator.clean()))
+    for f in futs:
+        try:
+            f.result(timeout=5)
+        except Exception:
+            pass
+
+
+def run_pipeline(
     run_config: RunConfig,
     prompt_text: str,
     evaluate_code: str,
     seed_function: code_manipulation.ParsedFunction,
     data_dict: dict,
 ) -> None:
-    """Launches a distributed pipeline experiment."""
-    prompt_queue = mp.Queue()
-    prompt_pending_count = mp.Value("i", 0)
-    sample_pending_count = mp.Value("i", 0)
-    sample_queue = mp.Queue()
-    result_queue = mp.Queue()
-    initial_result_queue = mp.Queue()
-    perf_queue = mp.Queue()
+    """Run the sampling-evaluation pipeline.
 
-    termination_event = mp.Event()
+    Architecture::
 
-    processes: list[mp.Process] = []
-
-    # Monitoring
-    monitor_process = mp.Process(target=monitoring_worker, args=(run_config, perf_queue, termination_event))
-    monitor_process.start()
-    processes.append(monitor_process)
-
-    process_initial = not run_config.resume_from_ckpt
-
-    # Evaluators
-    for i in range(run_config.num_evaluators):
-        p = mp.Process(
-            target=evaluator_worker,
-            args=(
-                i, evaluate_code, seed_function, data_dict,
-                sample_queue, sample_pending_count, result_queue, initial_result_queue,
-                termination_event, perf_queue, i == 0 and process_initial,
-            ),
-            kwargs={"evaluator_config": run_config.evaluator},
-        )
-        p.start()
-        processes.append(p)
-
-    if process_initial:
-        time.sleep(2)
-
-    # Database
-    db_process = mp.Process(
-        target=database_worker,
-        args=(
-            run_config, prompt_text,
-            prompt_queue, prompt_pending_count, result_queue, initial_result_queue,
-            termination_event, perf_queue,
-        ),
+        Main Thread (orchestrator + database + profiler + complexity)
+        ├── ThreadPoolExecutor (num_samplers threads for LLM I/O)
+        └── ThreadPoolExecutor (num_evaluators threads for sandbox eval)
+            └── Each thread has Evaluator (thread-local)
+                └── Sandbox(mp.Pool(1))  ← only mp.Pool left
+    """
+    eval_pool = ThreadPoolExecutor(
+        max_workers=run_config.num_evaluators,
+        initializer=_init_eval_thread,
+        initargs=(evaluate_code, seed_function, data_dict, run_config.evaluator),
     )
-    db_process.start()
-    processes.append(db_process)
-
-    # Samplers
-    for i in range(run_config.num_samplers):
-        p = mp.Process(
-            target=sampler_worker,
-            args=(
-                i, run_config.num_evaluators,
-                prompt_queue, prompt_pending_count, sample_queue, sample_pending_count,
-                termination_event, perf_queue,
-            ),
-            kwargs={"sampler_config": run_config.sampler},
-        )
-        p.start()
-        processes.append(p)
 
     try:
-        while not termination_event.is_set():
-            time.sleep(5)
-
-        _close_queues([prompt_queue, sample_queue, result_queue, initial_result_queue, perf_queue], logger)
-
-        for p in processes:
-            p.join(10)
-            if p.is_alive():
-                logger.warning("%s still alive, terminating", p.name)
-                p.terminate()
-
-        logger.info("All processes have completed, main_distributed is exiting")
-    except KeyboardInterrupt:
-        termination_event.set()
-        time.sleep(5)
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-        logger.info("Terminated due to KeyboardInterrupt, main_distributed is exiting")
-
-
-# ---------------------------------------------------------------------------
-# Non-distributed (single-process) mode
-# ---------------------------------------------------------------------------
-
-def main_single(
-    run_config: RunConfig,
-    prompt_text: str,
-    evaluate_code: str,
-    seed_function: code_manipulation.ParsedFunction,
-    input_data: dict,
-) -> None:
-    """Launches a single-process experiment."""
-    evaluators = evaluator_mod.Evaluator(
-        evaluate_code, seed_function, input_data,
-        config=run_config.evaluator,
-    )
-
-    initial_result = None
-    if not run_config.resume_from_ckpt:
-        initial_result = evaluators.initialize()
-
-    database = ProgramsDatabase.restore_or_create(
-        run_config.database, prompt_text, run_config.log_dir,
-        ckpt_dir=run_config.save_ckpt_dir,
-        max_samples=run_config.max_samples,
-        resume_path=run_config.resume_from_ckpt, initial_result=initial_result,
-        run_config=run_config,
-    )
-
-    llm = sampler_mod.LLM(config=run_config.sampler)
-
-    try:
-        while True:
-            prompt = database.get_prompt()
-            reset_time = time.time()
-            all_samples_info = llm.draw_samples(prompt.code)
-            sample_time = (time.time() - reset_time) / run_config.sampler.samples_per_prompt
-
-            for sample_info in all_samples_info:
-                if not sample_info:
-                    continue
-                sample_msg = SampleMessage(
-                    llm_response=sample_info,
-                    island_id=prompt.island_id,
-                    sample_time=sample_time,
+        # Seed evaluation (blocking)
+        initial_result = None
+        if not run_config.resume_from_ckpt:
+            initial_result = eval_pool.submit(_eval_thread_initialize).result()
+            if initial_result is None or initial_result.execution_result is None:
+                err_detail = ""
+                if initial_result is not None:
+                    err_detail = f": [{initial_result.error_type}] {initial_result.error_message}"
+                raise RuntimeError(
+                    f"Seed function evaluation failed{err_detail}. "
+                    "Cannot start without a valid seed program."
                 )
-                try:
-                    eval_result = evaluators.analyse(sample_msg)
-                    if eval_result is not None:
-                        database.register_program(eval_result, sample_msg)
-                    else:
-                        logger.warning("Error analysing sample: %s", sample_info.response_text)
-                except Exception:
-                    logger.warning("Error analysing sample: %s", getattr(sample_info, "response_text", "unknown"))
+            initial_result = _attach_complexity(initial_result)
 
-            if database.should_stop:
-                break
+        database = ProgramsDatabase.restore_or_create(
+            run_config.database, prompt_text, run_config.log_dir,
+            ckpt_dir=run_config.save_ckpt_dir,
+            max_samples=run_config.max_samples,
+            resume_path=run_config.resume_from_ckpt,
+            initial_result=initial_result,
+            run_config=run_config,
+        )
+
+        llm = sampler_mod.LLM(config=run_config.sampler)
+        sampler_pool = ThreadPoolExecutor(max_workers=run_config.num_samplers)
+
+        pending_sampler_futures: set[Future] = set()
+        pending_eval_futures: set[Future] = set()
+        max_pending = run_config.num_evaluators * 2  # backpressure
+
+        pipeline_start = time.time()
+
+        try:
+            while not database.should_stop:
+                # 1. Collect completed evals -> register in DB
+                done_eval_futures: set[Future] = set()
+                for fut in pending_eval_futures:
+                    if fut.done():
+                        done_eval_futures.add(fut)
+                        try:
+                            eval_result, sample_msg = fut.result()
+                            eval_result = _attach_complexity(eval_result)
+                            database.register_program(eval_result, sample_msg)
+                        except Exception as e:
+                            logger.error("Eval worker error: %s", e)
+                pending_eval_futures -= done_eval_futures
+
+                # 2. Collect completed samples -> submit to eval pool
+                done_futures: set[Future] = set()
+                for fut in pending_sampler_futures:
+                    if fut.done():
+                        done_futures.add(fut)
+                        try:
+                            msg = fut.result()
+                            if msg is not None:
+                                ef = eval_pool.submit(_eval_thread_analyse, msg)
+                                pending_eval_futures.add(ef)
+                        except Exception as e:
+                            logger.error("Sampler error: %s", e)
+                pending_sampler_futures -= done_futures
+
+                # 3. Submit new prompts (if under backpressure limit)
+                while (
+                    len(pending_eval_futures) < max_pending
+                    and len(pending_sampler_futures) < run_config.num_samplers
+                    and not database.should_stop
+                ):
+                    prompt = database.get_prompt()
+                    for _ in range(run_config.sampler.samples_per_prompt):
+                        fut = sampler_pool.submit(
+                            _sampler_task, llm, prompt.code, prompt.island_id,
+                        )
+                        pending_sampler_futures.add(fut)
+
+                # 4. Update pipeline stats for profiler
+                database.update_pipeline_stats(
+                    pending_evals=len(pending_eval_futures),
+                    pending_samplers=len(pending_sampler_futures),
+                    wall_time_seconds=time.time() - pipeline_start,
+                )
+
+                time.sleep(0.05)  # avoid busy-wait
+
+        except KeyboardInterrupt:
+            logger.info("KeyboardInterrupt received, shutting down pipeline")
+            # Cancel pending sampler futures
+            for fut in pending_sampler_futures:
+                fut.cancel()
+
+            # Drain remaining evals with timeout
+            deadline = time.time() + 30
+            for ef in pending_eval_futures:
+                remaining = max(0, deadline - time.time())
+                try:
+                    eval_result, sample_msg = ef.result(timeout=remaining)
+                    eval_result = _attach_complexity(eval_result)
+                    database.register_program(eval_result, sample_msg)
+                except Exception as e:
+                    logger.error("Error draining eval future during shutdown: %s", e)
+        finally:
+            sampler_pool.shutdown(wait=False, cancel_futures=True)
+            llm.clean()
+            database.finalize()
     finally:
-        database.finalize()
-        logger.info("Best program per complexity file written")
+        _cleanup_eval_threads(eval_pool)
+        eval_pool.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------
@@ -219,10 +283,9 @@ def main() -> None:
     parser.add_argument("--config", type=str, required=True, help="Path to YAML config file")
     args = parser.parse_args()
 
-    configure_logging()
-
     run_config = RunConfig.from_yaml(args.config)
     run_config.validate()
+    configure_logging(log_file=os.path.join(run_config.log_dir, "pipeline.log"))
 
     if run_config.resume_from_ckpt:
         logger.info("Resuming from checkpoint: %s", run_config.resume_from_ckpt)
@@ -233,13 +296,10 @@ def main() -> None:
         run_config.problem_dir, run_config.data_folder,
     )
 
-    if run_config.distributed:
-        logger.info("Running in distributed mode")
-        main_distributed(
-            run_config, prompt_text, evaluate_code, seed_function, data_dict,
-        )
-    else:
-        logger.info("Running in non-distributed mode")
-        main_single(
-            run_config, prompt_text, evaluate_code, seed_function, data_dict,
-        )
+    logger.info(
+        "Running pipeline with %d sampler threads, %d evaluator threads",
+        run_config.num_samplers, run_config.num_evaluators,
+    )
+    run_pipeline(
+        run_config, prompt_text, evaluate_code, seed_function, data_dict,
+    )

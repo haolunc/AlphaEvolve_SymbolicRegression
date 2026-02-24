@@ -46,8 +46,6 @@ class ExecutionResult:
 
     score: float
     optimized_params: list[float] | None
-    complexity: int | None
-    complexity_detail: dict
 
 
 @dataclasses.dataclass(frozen=True)
@@ -61,12 +59,9 @@ class EvalResult:
     function: code_manipulation.ParsedFunction
     execution_result: ExecutionResult | None
     evaluate_time: float | None
+    complexity: int | None = None
+    complexity_detail: dict | None = None
+    error_type: str | None = None
+    error_message: str | None = None
 
 
-@dataclasses.dataclass(frozen=True)
-class PerfMessage:
-    """Performance statistics from any worker, consumed by monitoring_worker."""
-
-    worker_type: str
-    worker_id: int
-    stats: dict

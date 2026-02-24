@@ -5,13 +5,10 @@ from __future__ import annotations
 import os
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Collection
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from dotenv import load_dotenv
 
 from .config import SamplerConfig
-from .exceptions import LLMProviderError
 from .logging_config import get_logger
 from .messages import LLMResponse
 
@@ -19,7 +16,7 @@ logger = get_logger("sampler")
 
 
 # ---------------------------------------------------------------------------
-# Provider interface and implementations (Phase 5)
+# Provider interface and implementations
 # ---------------------------------------------------------------------------
 
 
@@ -34,12 +31,14 @@ class LLMProvider(ABC):
 class OpenAIProvider(LLMProvider):
     """Provider for the OpenAI API."""
 
-    def generate(self, prompt: str, config: SamplerConfig) -> LLMResponse:
+    def __init__(self) -> None:
         from openai import OpenAI
 
+        self._client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+    def generate(self, prompt: str, config: SamplerConfig) -> LLMResponse:
         model = config.model_name or "gpt-5-mini"
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        response = client.responses.create(
+        response = self._client.responses.create(
             model=model,
             input=prompt,
             reasoning={"effort": "medium"},
@@ -54,14 +53,16 @@ class OpenAIProvider(LLMProvider):
 class QwenProvider(LLMProvider):
     """Provider for Qwen models via the OpenAI-compatible API."""
 
-    def generate(self, prompt: str, config: SamplerConfig) -> LLMResponse:
+    def __init__(self) -> None:
         from openai import OpenAI
 
-        model = config.model_name or "qwen3-max"
-        client = OpenAI(
+        self._client = OpenAI(
             api_key=os.getenv("QWEN_API_KEY"),
             base_url=os.getenv("QWEN_BASE_URL"),
         )
+
+    def generate(self, prompt: str, config: SamplerConfig) -> LLMResponse:
+        model = config.model_name or "qwen3-max"
 
         kwargs: dict = {
             "model": model,
@@ -73,7 +74,7 @@ class QwenProvider(LLMProvider):
         if model == "qwen3-max-preview":
             kwargs["extra_body"] = {"enable_thinking": True}
 
-        completion = client.chat.completions.create(**kwargs)
+        completion = self._client.chat.completions.create(**kwargs)
         return LLMResponse(
             response_text=completion.choices[0].message.content,
             input_tokens=completion.usage.prompt_tokens,
@@ -84,14 +85,17 @@ class QwenProvider(LLMProvider):
 class GeminiProvider(LLMProvider):
     """Provider for Google Gemini models."""
 
-    def generate(self, prompt: str, config: SamplerConfig) -> LLMResponse:
+    def __init__(self) -> None:
         from google import genai
+
+        self._client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+
+    def generate(self, prompt: str, config: SamplerConfig) -> LLMResponse:
         from google.genai import types
 
-        client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
         model_id = config.model_name or "gemini-3-pro-preview"
 
-        response = client.models.generate_content(
+        response = self._client.models.generate_content(
             model=model_id,
             contents=prompt,
             config=types.GenerateContentConfig(temperature=config.temperature),
@@ -121,7 +125,6 @@ def _make_provider(name: str) -> LLMProvider:
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
-
 class LLM:
     """Language model that predicts continuation of provided source code."""
 
@@ -131,73 +134,32 @@ class LLM:
     ) -> None:
         load_dotenv()
         self._config = config or SamplerConfig()
-        self._samples_per_prompt = self._config.samples_per_prompt
         self._cost_per_ktoken = self._config.cost_per_ktoken
         self._provider = _make_provider(self._config.provider)
-        # Create a persistent executor for concurrent sampling (not Gemini, not single-sample)
-        if self._samples_per_prompt > 1:
-            self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
-                max_workers=self._samples_per_prompt
-            )
-        else:
-            self._executor = None
 
     def clean(self) -> None:
-        """Shut down the thread pool executor."""
-        if self._executor is not None:
-            self._executor.shutdown(wait=False)
-            self._executor = None
-            logger.debug("LLM executor shutdown complete")
+        """Release any held resources (currently a no-op)."""
 
-    def draw_samples(self, prompt: str) -> Collection[LLMResponse] | None:
-        """Return predicted continuations of *prompt*."""
-        if self._samples_per_prompt == 1:
-            try:
-                sample_info = self._query_with_retry(prompt)
-                if sample_info:
-                    return [sample_info]
-                return []
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                logger.error("Exception in draw_samples: %s", e)
-                return None
-
-        try:
-            futures = {
-                self._executor.submit(self._query_with_retry, prompt): i
-                for i in range(self._samples_per_prompt)
-            }
-            results: list[LLMResponse] = []
-            for future in as_completed(futures):
-                try:
-                    info = future.result()
-                    results.append(info)
-                except Exception as e:
-                    logger.error("Request failed: %s", e)
-            logger.debug("Collected %d samples", len(results))
-            return results
-        except KeyboardInterrupt:
-            self.clean()
-            raise
-        except Exception as e:
-            logger.error("Exception in draw_samples: %s", e)
-            return None
-
-    def _query_with_retry(self, prompt: str) -> LLMResponse | None:
-        """Query the LLM provider with retry logic."""
+    def query(self, prompt: str) -> LLMResponse | None:
+        """Make a single LLM call with retries; return *None* on failure."""
         cfg = self._config
+        last_error: Exception | None = None
         for attempt in range(cfg.max_retries):
             try:
                 resp = self._provider.generate(prompt, cfg)
-                resp.token_cost = (
+                cost = (
                     resp.input_tokens * self._cost_per_ktoken[0]
                     + resp.output_tokens * self._cost_per_ktoken[1]
                 ) / 1000
-                return resp
+                return LLMResponse(
+                    response_text=resp.response_text,
+                    input_tokens=resp.input_tokens,
+                    output_tokens=resp.output_tokens,
+                    token_cost=cost,
+                )
             except Exception as e:
+                last_error = e
                 logger.warning("Request attempt %d failed: %s. Retrying...", attempt + 1, e)
                 time.sleep(cfg.retry_delay_seconds)
-        raise LLMProviderError(
-            f"All {cfg.max_retries} retries failed for LLM request"
-        )
+        logger.error("All %d retries failed for LLM request. Last error: %s", cfg.max_retries, last_error)
+        return None

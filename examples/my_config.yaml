@@ -3,64 +3,50 @@
 # =====================================================================
 problem_dir: examples/dft_xc/        # Path to problem directory (e.g. specs/dft_xc/)
 data_folder: examples/data/dft_ev_xc        # Path to data folder containing train.csv
-log_folder: examples/log/         # Name for this experiment's log directory
+log_dir: examples/log/               # Path to log directory
 
 # =====================================================================
 # Pipeline
 # =====================================================================
-problem_name: oscillator1
 max_samples: 3600
-distributed: true
-num_samplers: 2
-num_evaluators: 2
+num_samplers: 2                      # Concurrent LLM threads
+num_evaluators: 2                    # Persistent sandbox processes
 
 # =====================================================================
 # Checkpointing (saves are incremental via SQLite — no interval needed)
 # =====================================================================
-# save_ckpt_dir:     # Auto-derived from log_folder if omitted
-# resume_from_ckpt:  # Set to checkpoint dir path to resume
+# save_ckpt_dir:     # Auto-derived from log_dir if omitted
+# resume_from_ckpt:  # Set to checkpoint dir/file path to resume
 
 # =====================================================================
 # LLM sampler
 # =====================================================================
 sampler:
   provider: qwen
-  samples_per_prompt: 1
-  # model_name:                # Provider default if omitted
+  samples_per_prompt: 1              # Sequential LLM calls per prompt
+  # model_name:                      # Provider default if omitted
   temperature: 1.0
   max_retries: 5
   retry_delay_seconds: 5.0
   request_timeout_seconds: 180
-  cost_per_ktoken: [0.006, 0.024]   # Cost per 1K tokens (input, output) for tracking
+  cost_per_ktoken: [0.006, 0.024]    # Cost per 1K tokens (input, output) for tracking
 
 # =====================================================================
 # Evolutionary algorithm / database
 # =====================================================================
 database:
-  functions_per_prompt: 4 # Number of historical programs to include in each prompt
-  num_islands: 10 # Number of parallel islands for diversity
-  reset_period: 700  # Samples between island resets
+  functions_per_prompt: 4            # Number of historical programs to include in each prompt
+  num_islands: 10                    # Number of parallel islands for diversity
+  reset_period: 700                  # Samples between island resets
   cluster_sampling_temperature_init: 0.005   # Initial temperature for softmax sampling
   cluster_sampling_temperature_period: 200   # Period for temperature linear decay cycle
   complexity_bin_size: 10
   cluster_max_size: 100
   pareto_aware: false
+  log_frequency: 25                  # Write detailed TensorBoard logs every N samples
 
 # =====================================================================
 # Evaluator
 # =====================================================================
 evaluator:
   timeout_seconds: 400
-
-# =====================================================================
-# Profiler (TensorBoard logging)
-# =====================================================================
-profiler:
-  log_frequency: 100
-
-# =====================================================================
-# Worker performance reporting
-# =====================================================================
-worker:
-  perf_report_interval_seconds: 150
-  monitor_interval_seconds: 300

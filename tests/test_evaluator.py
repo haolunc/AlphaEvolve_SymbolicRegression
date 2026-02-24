@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-
 import pytest
 
 from alpha_evolve_sr.code_manipulation import ParsedFunction
-from alpha_evolve_sr.evaluator import Evaluator, Sandbox, _extract_python_text, _sample_to_program
+from alpha_evolve_sr.evaluator import (
+    Evaluator,
+    Sandbox,
+    _extract_python_text,
+    _sample_to_program,
+)
 from alpha_evolve_sr.messages import EvalResult, LLMResponse, SampleMessage
 from tests.conftest import SAMPLE_EVALUATE_CODE, SAMPLE_SEED_FUNCTION
 
@@ -45,6 +48,16 @@ class TestSampleToProgram:
         func, _ = _sample_to_program(new_body, SAMPLE_EVALUATE_CODE, SAMPLE_SEED_FUNCTION)
         assert "x + 42" in func.body
 
+    def test_preserves_decorators_in_program_string(self):
+        seed = ParsedFunction(
+            name="equation", args="x, params", body="    return x",
+            decorators=("jax.jit",),
+        )
+        func, prog_str = _sample_to_program("    return x * 2", SAMPLE_EVALUATE_CODE, seed)
+        assert func.decorators == ("jax.jit",)
+        assert "@jax.jit" in prog_str
+        assert prog_str.index("@jax.jit") < prog_str.index("def equation")
+
 
 class TestSandbox:
     """Tests for Sandbox.run."""
@@ -57,27 +70,33 @@ class TestSandbox:
 
     def test_successful_execution(self, sandbox):
         program = "def evaluate(data):\n    return (data['x'].sum(), [1.0]), True\n"
-        result, success = sandbox.run(program, {"x": __import__("numpy").array([1, 2, 3])}, 10)
+        result, success, error_str = sandbox.run(program, {"x": __import__("numpy").array([1, 2, 3])}, 10)
         assert success
         assert result is not None
+        assert error_str is None
 
     def test_timeout_returns_none(self, sandbox):
         program = "import time\ndef evaluate(data):\n    time.sleep(100)\n    return None, True\n"
-        result, success = sandbox.run(program, {}, 1)
+        result, success, error_str = sandbox.run(program, {}, 1)
         assert not success
         assert result is None
+        assert error_str is not None
+        assert "TimeoutError" in error_str
 
     def test_missing_function_returns_none(self, sandbox):
         program = "def other_func(data):\n    return 1, True\n"
-        result, success = sandbox.run(program, {}, 5)
+        result, success, error_str = sandbox.run(program, {}, 5)
         assert not success
         assert result is None
+        assert error_str is not None
 
     def test_exception_in_code_returns_none(self, sandbox):
         program = "def evaluate(data):\n    raise ValueError('boom')\n"
-        result, success = sandbox.run(program, {}, 5)
+        result, success, error_str = sandbox.run(program, {}, 5)
         assert not success
         assert result is None
+        assert error_str is not None
+        assert "ValueError" in error_str
 
 
 class TestEvaluator:
@@ -121,8 +140,8 @@ class TestEvaluator:
         assert result.evaluate_time is not None
         assert result.evaluate_time >= 0
 
-    def test_analyse_returns_none_on_parse_error(self, evaluator):
-        """analyse() returns None when the sample can't be parsed."""
+    def test_analyse_returns_error_on_parse_failure(self, evaluator):
+        """analyse() returns EvalResult with error info when parsing fails."""
         sample_msg = SampleMessage(
             llm_response=LLMResponse(
                 response_text="this is not valid python at all {{{",
@@ -134,7 +153,10 @@ class TestEvaluator:
             sample_time=0.5,
         )
         result = evaluator.analyse(sample_msg)
-        assert result is None
+        assert isinstance(result, EvalResult)
+        assert result.execution_result is None
+        assert result.error_type == "parse"
+        assert result.error_message is not None
 
     def test_analyse_eval_result_has_no_sampling_metadata(self, evaluator):
         """EvalResult from analyse() does not contain sampling metadata."""
@@ -159,3 +181,5 @@ class TestEvaluator:
         """Calling clean() multiple times should not raise."""
         evaluator.clean()
         evaluator.clean()
+
+

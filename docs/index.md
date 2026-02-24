@@ -11,6 +11,7 @@ Inspired by [FunSearch](https://www.nature.com/articles/s41586-023-06924-6) (Nat
 
 introduction
 getting-started
+architecture/pipeline
 architecture/data-flow
 architecture/input-files
 architecture/config

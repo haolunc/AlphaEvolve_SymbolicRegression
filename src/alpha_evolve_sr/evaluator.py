@@ -23,10 +23,7 @@ import multiprocessing as mp
 import time
 from typing import Any
 
-import jax
-
 from . import code_manipulation
-from .complexity import complexity_score
 from .config import EvaluatorConfig
 from .logging_config import get_logger
 from .messages import EvalResult, ExecutionResult, SampleMessage
@@ -53,32 +50,29 @@ def _sample_to_program(
 
 
 def _execute_in_subprocess(
-    program: str, data_dict: dict, result_queue: mp.Queue | None = None
-) -> tuple[Any, bool]:
-    """Execute untrusted code in a subprocess and return the result."""
+    program: str, data_dict: dict,
+) -> tuple[Any, bool, str | None]:
+    """Execute untrusted code in a subprocess and return the result.
+
+    Returns:
+        (result, success, error_str) — *error_str* is ``None`` on success.
+    """
     try:
         namespace: dict = {}
         exec(program, namespace)
 
-        if "equation" in namespace:
-            namespace["equation"] = jax.jit(namespace["equation"])
-        if "get_gradients" in namespace:
-            namespace["get_gradients"] = jax.jit(namespace["get_gradients"])
-
         if "evaluate" not in namespace:
-            return None, False
+            error_str = "NameError: 'evaluate' function not defined in program"
+            return None, False, error_str
 
         function = namespace["evaluate"]
         result = function(data_dict)
 
-        if result_queue is not None:
-            result_queue.put((result, True))
-        return result, True
+        return result, True, None
     except Exception as e:
-        logger.error("Execution failed: %s", e)
-        if result_queue is not None:
-            result_queue.put((None, False))
-        return None, False
+        error_str = f"{type(e).__name__}: {e}"
+        logger.error("Execution failed: %s", error_str)
+        return None, False, error_str
 
 
 class Sandbox:
@@ -99,48 +93,51 @@ class Sandbox:
             self._pool = mp.get_context("spawn").Pool(processes=1)
         return self._pool
 
-    def _kill_and_recreate(self) -> None:
+    def clean(self) -> None:
         """Terminate the current pool so the next call creates a fresh one."""
         if self._pool is not None:
             try:
                 self._pool.terminate()
                 self._pool.join()
+            # If the pool is already exited
             except Exception:
                 pass
             self._pool = None
-
-    def clean(self) -> None:
-        """Terminate any active process pool."""
-        self._kill_and_recreate()
 
     def run(
         self,
         program: str,
         data_dict: dict,
         timeout_seconds: int,
-    ) -> tuple[Any, bool]:
-        """Execute the ``evaluate`` function inside *program* with a timeout."""
+    ) -> tuple[Any, bool, str | None]:
+        """Execute the ``evaluate`` function inside *program* with a timeout.
+
+        Returns:
+            (result, success, error_str) — *error_str* is ``None`` on success.
+        """
         try:
             pool = self._ensure_pool()
             async_result = pool.apply_async(
-                _execute_in_subprocess, args=(program, data_dict, None)
+                _execute_in_subprocess, args=(program, data_dict)
             )
             try:
-                result, success = async_result.get(timeout=timeout_seconds)
+                result, success, error_str = async_result.get(timeout=timeout_seconds)
                 if not success:
                     logger.warning("Sandbox execution completed but reported failure")
-                return result, success
+                return result, success, error_str
             except mp.TimeoutError:
+                error_str = f"TimeoutError: execution exceeded {timeout_seconds}s"
                 logger.warning("Process execution timed out after %d seconds", timeout_seconds)
-                self._kill_and_recreate()
-                return None, False
+                self.clean()
+                return None, False, error_str
         except KeyboardInterrupt:
             self.clean()
             raise
         except Exception as e:
+            error_str = f"SandboxError: {type(e).__name__}: {e}"
             logger.error("Sandbox execution error: %s", e)
-            self._kill_and_recreate()
-            return None, False
+            self.clean()
+            return None, False, error_str
 
 
 class Evaluator:
@@ -163,55 +160,60 @@ class Evaluator:
         """Release sandbox resources."""
         self._sandbox.clean()
 
-    def _evaluate_body(self, sample_body: str) -> EvalResult | None:
+    def _evaluate_body(self, sample_body: str) -> EvalResult:
         """Build program from *sample_body*, execute in sandbox, return ``EvalResult``."""
         new_function, program = _sample_to_program(
             sample_body, self._evaluate_code, self._seed_function
         )
 
         time_reset = time.time()
-        run_result, runs_ok = self._sandbox.run(
+        run_result, runs_ok, error_str = self._sandbox.run(
             program, self._data_dict, self._config.timeout_seconds
         )
         evaluate_time = time.time() - time_reset
 
         execution_result: ExecutionResult | None = None
+        error_type: str | None = None
+        error_message: str | None = None
         if runs_ok and run_result is not None:
-            try:
-                complexity_val, complexity_detail = complexity_score(str(new_function), return_breakdown=True)
-            except Exception as e:
-                logger.error("Error calculating complexity for %s: %s", new_function.name, e)
-                complexity_val = None
-                complexity_detail = {}
-
             execution_result = ExecutionResult(
                 score=run_result[0],
                 optimized_params=run_result[1],
-                complexity=complexity_val,
-                complexity_detail=complexity_detail,
             )
+        elif not runs_ok:
+            error_type = "timeout" if "TimeoutError" in (error_str or "") else "execution"
+            error_message = error_str
 
         return EvalResult(
             function=new_function,
             execution_result=execution_result,
             evaluate_time=evaluate_time,
+            error_type=error_type,
+            error_message=error_message,
         )
 
-    def initialize(self) -> EvalResult | None:
-        """Evaluate the seed function. Returns ``EvalResult`` or ``None``."""
+    def initialize(self) -> EvalResult:
+        """Evaluate the seed function. Returns ``EvalResult``."""
         return self._evaluate_body(self._seed_function.body)
 
-    def analyse(self, sample_message: SampleMessage) -> EvalResult | None:
+    def analyse(self, sample_message: SampleMessage) -> EvalResult:
         """Parse an LLM-generated sample and evaluate it.
 
-        Returns an ``EvalResult`` on success, or ``None`` on failure.
+        Always returns an ``EvalResult`` — on parse failure, the result carries
+        ``error_type='parse'`` and ``error_message``.
         """
         try:
             sample_function_body = code_manipulation.text_to_function(
                 _extract_python_text(sample_message.llm_response.response_text)
             ).body
         except Exception as e:
-            logger.error("Error parsing sample: %s\n %s", e, sample_message.llm_response.response_text)
-            return None
+            logger.error("Error parsing sample: %s", e)
+            return EvalResult(
+                function=self._seed_function,
+                execution_result=None,
+                evaluate_time=None,
+                error_type="parse",
+                error_message=str(e),
+            )
 
         return self._evaluate_body(sample_function_body)

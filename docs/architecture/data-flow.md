@@ -1,70 +1,55 @@
 # Data Flow
 
-## Single-Chain Mode
-
-```{mermaid}
-sequenceDiagram
-    participant DB as ProgramsDatabase
-    participant LLM as LLM (Sampler)
-    participant Eval as Evaluator
-
-    Note over Eval: initialize(): evaluate seed function
-    Eval->>DB: EvalResult (seed score + complexity)
-    Note over DB: Create database with seed program
-
-    loop Every iteration
-        DB->>DB: get_prompt() → Prompt
-        DB->>LLM: Prompt.code
-        LLM->>LLM: draw_samples() → LLMResponse[]
-        LLM->>Eval: SampleMessage (response + island_id)
-        Eval->>Eval: analyse() → parse, splice, sandbox exec
-        Eval->>DB: EvalResult + SampleMessage
-        DB->>DB: register_program()
-    end
-```
-
-## Distributed Mode
+## Pipeline Architecture
 
 ```{mermaid}
 flowchart LR
-    subgraph init ["Initialization"]
-        E0["Evaluator 0"]
-        IRQ[("initial_result_queue")]
-        E0 -->|EvalResult| IRQ
+    subgraph main ["Main Thread"]
+        DB["ProgramsDatabase"]
+        PROF["TensorBoard\nProfiler"]
     end
 
-    subgraph main ["Main Loop"]
-        DBW["Database\nWorker"]
-        PQ[("prompt_queue")]
-        SW["Sampler\nWorkers ×N"]
-        SQ[("sample_queue")]
-        EW["Evaluator\nWorkers ×M"]
-        RQ[("result_queue")]
-
-        IRQ -->|seed result| DBW
-        DBW -->|Prompt| PQ
-        PQ --> SW
-        SW -->|SampleMessage| SQ
-        SQ --> EW
-        EW -->|"(EvalResult, SampleMessage)"| RQ
-        RQ --> DBW
+    subgraph threads ["ThreadPoolExecutor"]
+        S1["Sampler\nThread 1"]
+        S2["Sampler\nThread 2"]
+        SN["Sampler\nThread N"]
     end
 
-    subgraph monitor ["Monitoring"]
-        PFQ[("perf_queue")]
-        MON["Monitor\nWorker"]
-        DBW -.->|PerfMessage| PFQ
-        SW -.->|PerfMessage| PFQ
-        EW -.->|PerfMessage| PFQ
-        PFQ -.-> MON
+    subgraph pool ["mp.Pool (spawn)"]
+        E1["Evaluator\nProcess 1"]
+        E2["Evaluator\nProcess 2"]
+        EM["Evaluator\nProcess M"]
     end
+
+    DB -->|"Prompt"| S1
+    DB -->|"Prompt"| S2
+    DB -->|"Prompt"| SN
+    S1 -->|"SampleMessage"| E1
+    S2 -->|"SampleMessage"| E2
+    SN -->|"SampleMessage"| EM
+    E1 -->|"(EvalResult, SampleMessage)"| DB
+    E2 -->|"(EvalResult, SampleMessage)"| DB
+    EM -->|"(EvalResult, SampleMessage)"| DB
+    DB -->|"ProfileMetrics"| PROF
 ```
+
+The main thread acts as the orchestrator:
+
+1. **Generates prompts** from `ProgramsDatabase.get_prompt()`
+2. **Submits LLM calls** to `ThreadPoolExecutor` (sampler threads)
+3. **Submits evaluations** to `mp.Pool` (evaluator processes)
+4. **Registers results** back into the database
+5. **Applies backpressure** — limits pending evals to `num_evaluators * 2`
+
+---
+
+## Initialization
+
+Before the main loop begins, the seed function is evaluated via `eval_pool.apply(eval_worker_initialize)` (blocking). The result is passed to `ProgramsDatabase.restore_or_create()`. When resuming from a checkpoint, this step is skipped.
 
 ---
 
 ## Glossary
-
-Every term on the diagrams above is briefly explained here, with links to detailed pages.
 
 ### Input Files
 
@@ -74,7 +59,7 @@ See {doc}`input-files` for format details and examples.
 
 ### Config
 
-A single YAML file parsed by `RunConfig.from_yaml()`. It contains top-level pipeline settings and nested sections for each component (`sampler`, `database`, `evaluator`, `profiler`, `worker`).
+A single YAML file parsed by `RunConfig.from_yaml()`. It contains top-level pipeline settings and nested sections for each component (`sampler`, `database`, `evaluator`).
 
 See {doc}`config` for the full reference.
 
@@ -86,7 +71,7 @@ See {doc}`evaluator` for internals.
 
 ### Sampler
 
-Wraps an LLM provider (OpenAI, Qwen, or Gemini) with retry logic and optional concurrent sampling via `ThreadPoolExecutor`. Sends a prompt string, receives `LLMResponse` objects.
+Wraps an LLM provider (OpenAI, Qwen, or Gemini) with retry logic. Each provider creates its HTTP client once in `__init__` for connection reuse. `draw_samples()` loops sequentially `samples_per_prompt` times; threading is managed at the pipeline level via `ThreadPoolExecutor`.
 
 See {doc}`sampler` for provider details and how to add new ones.
 
@@ -102,26 +87,8 @@ Typed dataclasses that flow between components:
 
 | Message | Direction | Purpose |
 |---------|-----------|---------|
-| `Prompt` | Database → Sampler | Prompt text + source island ID |
-| `SampleMessage` | Sampler → Evaluator | LLM response + timing metadata |
-| `EvalResult` | Evaluator → Database | Parsed function + execution result |
-| `PerfMessage` | Any worker → Monitor | Performance statistics |
+| `Prompt` | Database → Sampler threads | Prompt text + source island ID |
+| `SampleMessage` | Sampler threads → Evaluator pool | LLM response + timing metadata |
+| `EvalResult` | Evaluator pool → Database | Parsed function + execution result |
 
 See {doc}`messages` for the full dataclass reference.
-
-### Queues (distributed mode)
-
-| Queue | Carries | From → To |
-|-------|---------|-----------|
-| `prompt_queue` | `Prompt` | Database → Samplers |
-| `sample_queue` | `SampleMessage` | Samplers → Evaluators |
-| `result_queue` | `(EvalResult, SampleMessage)` | Evaluators → Database |
-| `initial_result_queue` | `EvalResult` | Evaluator 0 → Database (once, at startup) |
-| `perf_queue` | `PerfMessage` | All workers → Monitor |
-
-### Initialization
-
-Before the main loop begins, the seed function must be evaluated to give the database its first program:
-
-- **Single-chain**: `Evaluator.initialize()` is called directly; the result is passed to `ProgramsDatabase.restore_or_create()`.
-- **Distributed**: Evaluator 0 calls `initialize()` and puts the `EvalResult` on `initial_result_queue`. The database worker blocks on this queue before creating the database.

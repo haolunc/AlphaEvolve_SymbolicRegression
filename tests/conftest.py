@@ -43,9 +43,11 @@ def make_eval_result(score=-1.0):
     return EvalResult(
         function=func,
         execution_result=ExecutionResult(
-            score=score, optimized_params=None, complexity=5, complexity_detail={},
+            score=score, optimized_params=None,
         ),
         evaluate_time=0.2,
+        complexity=5,
+        complexity_detail={},
     )
 
 
@@ -61,6 +63,33 @@ def make_sample_message(island_id=0):
         island_id=island_id,
         sample_time=0.1,
     )
+
+
+def make_evaluated_program(gsn, score=-1.0, complexity=5):
+    """Build an EvaluatedProgram for testing."""
+    parsed = ParsedFunction(
+        name="equation", args="x, params", body="    return params[0] * x",
+    )
+    return EvaluatedProgram(
+        parsed=parsed,
+        score=score,
+        optimized_params=[1.0, 2.0],
+        complexity=complexity,
+        complexity_detail={"BinOp": 3},
+        global_sample_nums=gsn,
+        sample_time=0.1,
+        evaluate_time=0.2,
+        token_usage=(10, 20),
+        token_cost=0.001,
+    )
+
+
+def finished_future(value):
+    """Return a Future already resolved with *value*."""
+    from concurrent.futures import Future
+    f = Future()
+    f.set_result(value)
+    return f
 
 
 @pytest.fixture

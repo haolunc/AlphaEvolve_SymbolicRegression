@@ -16,19 +16,18 @@
 
 ```
 src/alpha_evolve_sr/       # Main package (src layout)
-├── cli.py                 # Entry point: main(), main_distributed(), main_single()
+├── cli.py                 # Entry point: main(), run_pipeline()
 ├── code_manipulation.py   # AST parsing: Function, Program dataclasses
 ├── database.py            # Evolutionary algorithm: ProgramsDatabase, Island, Cluster
-├── workers.py             # Multiprocessing workers for distributed mode
 ├── sampler.py             # LLM provider abstraction (OpenAI, Qwen, Gemini)
-├── evaluator.py           # Sandbox code execution and evaluation
-├── profiler.py            # TensorBoard + JSON logging
+├── evaluator.py           # Sandbox code execution + mp.Pool worker functions
+├── profiler.py            # TensorBoard logging
 ├── config.py              # Frozen config dataclasses
-├── checkpoint.py          # Pickle-based persistence
+├── checkpoint.py          # SQLite-based persistence
 ├── complexity.py          # AST complexity scoring
 ├── exceptions.py          # Custom exception hierarchy
 ├── logging_config.py      # Logging setup
-└── messages.py            # Queue message dataclasses
+└── messages.py            # Pipeline message dataclasses
 
 tests/                     # pytest tests
 ├── conftest.py            # Shared fixtures: sample_function, sample_program, db_config, SAMPLE_SPEC
@@ -58,3 +57,5 @@ tests/                     # pytest tests
 - **Diagrams first** — show the picture, then explain it
 - **Dataclasses as documentation** — config and message dataclasses define contracts; reference them directly
 - **Stay focused** — include only what serves understanding; omit trivia
+
+No backward-compat needed!

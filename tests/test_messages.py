@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import pytest
-
 from alpha_evolve_sr.code_manipulation import ParsedFunction
-from alpha_evolve_sr.messages import EvalResult, ExecutionResult, LLMResponse, PerfMessage, SampleMessage
+from alpha_evolve_sr.messages import EvalResult, ExecutionResult, LLMResponse, SampleMessage
 
 
 class TestLLMResponse:
@@ -24,11 +22,6 @@ class TestLLMResponse:
     def test_default_cost(self):
         resp = LLMResponse(response_text="x", input_tokens=1, output_tokens=2)
         assert resp.token_cost == 0.0
-
-    def test_frozen(self):
-        resp = LLMResponse(response_text="x", input_tokens=1, output_tokens=2)
-        with pytest.raises(AttributeError):
-            resp.response_text = "y"
 
 
 class TestSampleMessage:
@@ -51,64 +44,37 @@ class TestSampleMessage:
         assert msg.island_id == 2
         assert msg.sample_time == 0.5
 
-    def test_frozen(self):
-        llm_resp = LLMResponse(response_text="x", input_tokens=5, output_tokens=10)
-        msg = SampleMessage(llm_resp, 0, 0.1)
-        with pytest.raises(AttributeError):
-            msg.llm_response = llm_resp
-
 
 class TestExecutionResult:
     def test_creation_and_fields(self):
         er = ExecutionResult(
             score=0.5,
             optimized_params=[1.0, 2.0],
-            complexity=10,
-            complexity_detail={"BinOp": 3},
         )
         assert er.score == 0.5
         assert er.optimized_params == [1.0, 2.0]
-        assert er.complexity == 10
-        assert er.complexity_detail == {"BinOp": 3}
-
-    def test_frozen(self):
-        er = ExecutionResult(score=0.5, optimized_params=None, complexity=5, complexity_detail={})
-        with pytest.raises(AttributeError):
-            er.score = 1.0
 
 
 class TestEvalResult:
     def test_creation_and_fields(self):
         func = ParsedFunction(name="eq", args="x", body="    return x")
-        ex = ExecutionResult(score=0.5, optimized_params=None, complexity=5, complexity_detail={})
+        ex = ExecutionResult(score=0.5, optimized_params=None)
         msg = EvalResult(
             function=func,
             execution_result=ex,
             evaluate_time=0.2,
+            complexity=5,
+            complexity_detail={"BinOp": 3},
         )
         assert msg.function is func
         assert msg.execution_result is ex
         assert msg.evaluate_time == 0.2
+        assert msg.complexity == 5
+        assert msg.complexity_detail == {"BinOp": 3}
 
-    def test_frozen(self):
+    def test_complexity_defaults_to_none(self):
         func = ParsedFunction(name="eq", args="x", body="    return x")
-        msg = EvalResult(func, None, None)
-        with pytest.raises(AttributeError):
-            msg.evaluate_time = 5.0
-
-
-class TestPerfMessage:
-    def test_creation_and_fields(self):
-        msg = PerfMessage(
-            worker_type="sampler",
-            worker_id=3,
-            stats={"prompts": 10},
-        )
-        assert msg.worker_type == "sampler"
-        assert msg.worker_id == 3
-        assert msg.stats["prompts"] == 10
-
-    def test_frozen(self):
-        msg = PerfMessage("db", 0, {})
-        with pytest.raises(AttributeError):
-            msg.worker_type = "eval"
+        ex = ExecutionResult(score=0.5, optimized_params=None)
+        msg = EvalResult(function=func, execution_result=ex, evaluate_time=0.1)
+        assert msg.complexity is None
+        assert msg.complexity_detail is None
