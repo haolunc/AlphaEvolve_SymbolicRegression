@@ -1,0 +1,53 @@
+# =====================================================================
+# Required
+# =====================================================================
+problem_dir:         # Path to problem directory (e.g. specs/dft_xc/)
+data_folder:         # Path to data folder containing train.csv
+log_dir:             # Path for logs and checkpoint (e.g. ./log/my_experiment/)
+
+# =====================================================================
+# Pipeline
+# =====================================================================
+max_samples: 3600
+num_samplers: 2
+num_evaluators: 2
+
+# =====================================================================
+# Checkpointing
+# =====================================================================
+# save_ckpt_dir:     # Defaults to log_dir if omitted
+# resume_from_ckpt:   # Path to checkpoint.db or its parent directory
+
+# =====================================================================
+# LLM sampler
+# =====================================================================
+sampler:
+  provider: qwen
+  samples_per_prompt: 1
+  # model_name:                # Provider default if omitted
+  temperature: 1.0
+  max_retries: 5
+  retry_delay_seconds: 5.0
+  request_timeout_seconds: 180
+  cost_per_ktoken: [0.006, 0.024]   # Cost per 1K tokens (input, output) for tracking
+
+# =====================================================================
+# Evolutionary algorithm / database
+# =====================================================================
+database:
+  functions_per_prompt: 4 # Number of historical programs to include in each prompt
+  num_islands: 10 # Number of parallel islands for diversity
+  reset_period: 700  # Samples between island resets
+  cluster_sampling_temperature_init: 0.005   # Initial temperature for softmax sampling
+  cluster_sampling_temperature_period: 200   # Period for temperature linear decay cycle
+  complexity_bin_size: 10
+  cluster_max_size: 100
+  pareto_aware: false
+  checkpoint_interval: 10     # Samples between checkpoint saves
+  log_frequency: 25           # TensorBoard logging interval (samples)
+
+# =====================================================================
+# Evaluator
+# =====================================================================
+evaluator:
+  timeout_seconds: 400

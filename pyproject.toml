@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpha-evolve-sr"
+version = "0.1.0"
+description = "LLM-guided symbolic regression using island-based evolutionary algorithms"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "pandas",
+    "jax",
+    "jaxlib",
+    "matplotlib",
+    "openai",
+    "python-dotenv",
+    "pyyaml",
+    "tensorboard",
+    "setuptools<82",  # tensorboard imports pkg_resources, removed in 82
+]
+
+[project.optional-dependencies]
+gemini = ["google-genai"]
+examples = ["cma"]
+dev = [
+    "pytest",
+    "ruff",
+    "mypy",
+    "cma",
+]
+docs = [
+    "sphinx",
+    "sphinx-rtd-theme",
+    "myst-parser",
+    "sphinxcontrib-mermaid",
+]
+
+[project.scripts]
+alpha-evolve-sr = "alpha_evolve_sr.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: real LLM integration tests (skipped by default)"]
+addopts = "-m 'not slow'"
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s %(name)s %(levelname)s %(message)s"
+log_cli_date_format = "%H:%M:%S"
