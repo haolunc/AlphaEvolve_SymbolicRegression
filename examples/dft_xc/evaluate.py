@@ -332,7 +332,6 @@ def evaluate(data: dict) -> float:
         solutions = es.ask()
         fitness_list = [combined_loss(x) for x in solutions]
         es.tell(solutions, fitness_list)
-        es.logger.add()
         es.disp()
 
     # Check if result is promising (< 0.05), if so continue to 300 iterations
@@ -345,7 +344,6 @@ def evaluate(data: dict) -> float:
             solutions = es.ask()
             fitness_list = [combined_loss(x) for x in solutions]
             es.tell(solutions, fitness_list)
-            es.logger.add()
             es.disp()
     else:
         print(f"Phase 1 result ({es.result.fbest:.6f}) >= 0.5, stopping early.")

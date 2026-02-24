@@ -3,14 +3,14 @@
 # =====================================================================
 problem_dir: examples/dft_xc/        # Path to problem directory (e.g. specs/dft_xc/)
 data_folder: examples/data/dft_ev_xc        # Path to data folder containing train.csv
-log_dir: examples/log/               # Path to log directory
+log_dir: examples/log1/               # Path to log directory
 
 # =====================================================================
 # Pipeline
 # =====================================================================
-max_samples: 3600
+max_samples: 20
 num_samplers: 2                      # Concurrent LLM threads
-num_evaluators: 2                    # Persistent sandbox processes
+num_evaluators: 3                    # Persistent sandbox processes
 
 # =====================================================================
 # Checkpointing (saves are incremental via SQLite — no interval needed)
@@ -43,7 +43,8 @@ database:
   complexity_bin_size: 10
   cluster_max_size: 100
   pareto_aware: false
-  log_frequency: 25                  # Write detailed TensorBoard logs every N samples
+  checkpoint_interval: 1            # Samples between checkpoint saves
+  log_frequency: 1                  # Write detailed TensorBoard logs every N samples
 
 # =====================================================================
 # Evaluator

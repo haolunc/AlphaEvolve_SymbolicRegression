@@ -53,3 +53,9 @@ select = ["E", "F", "W", "I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: real LLM integration tests (skipped by default)"]
+addopts = "-m 'not slow'"
+log_cli = true
+log_cli_level = "INFO"
+log_cli_format = "%(asctime)s %(name)s %(levelname)s %(message)s"
+log_cli_date_format = "%H:%M:%S"

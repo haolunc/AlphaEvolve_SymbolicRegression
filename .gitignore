@@ -18,3 +18,5 @@ docs/_build/
 .claude/
 .pytest_cache/
 .ruff_cache/
+outcmaes/
+examples/log1

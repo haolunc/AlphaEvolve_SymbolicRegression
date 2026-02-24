@@ -9,7 +9,6 @@ log_dir:             # Path for logs and checkpoint (e.g. ./log/my_experiment/)
 # Pipeline
 # =====================================================================
 max_samples: 3600
-distributed: true
 num_samplers: 2
 num_evaluators: 2
 
@@ -44,7 +43,7 @@ database:
   complexity_bin_size: 10
   cluster_max_size: 100
   pareto_aware: false
-  checkpoint_interval: 10
+  checkpoint_interval: 10     # Samples between checkpoint saves
   log_frequency: 25           # TensorBoard logging interval (samples)
 
 # =====================================================================
@@ -52,10 +51,3 @@ database:
 # =====================================================================
 evaluator:
   timeout_seconds: 400
-
-# =====================================================================
-# Worker performance reporting
-# =====================================================================
-worker:
-  perf_report_interval_seconds: 150
-  monitor_interval_seconds: 300

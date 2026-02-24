@@ -77,6 +77,17 @@ tests/
 tensorboard --logdir <log_dir> --port 6006
 ```
 
+## Testing
+
+| Command | What it does |
+|---------|-------------|
+| `pytest tests/ -v` | Unit tests only (integration skipped) |
+| `pytest tests/test_integration.py -m slow -v` | Integration tests against live LLM |
+
+Integration tests log progress in real time. After a run, inspect with:
+
+    tensorboard --logdir <log_dir printed at test start>
+
 ## Documentation
 
 Full architecture and reference documentation is built with Sphinx:

@@ -289,6 +289,8 @@ def main() -> None:
 
     if run_config.resume_from_ckpt:
         logger.info("Resuming from checkpoint: %s", run_config.resume_from_ckpt)
+    else:
+        logger.info("Fresh Start without resume!")
 
     mp.set_start_method("spawn")
 
