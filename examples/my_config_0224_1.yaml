@@ -3,20 +3,20 @@
 # =====================================================================
 problem_dir: examples/dft_xc/        # Path to problem directory (e.g. specs/dft_xc/)
 data_folder: examples/data/dft_ev_xc        # Path to data folder containing train.csv
-log_dir: examples/log1/               # Path to log directory
+log_dir: examples/log/0224_1               # Path to log directory
 
 # =====================================================================
 # Pipeline
 # =====================================================================
-max_samples: 20
-num_samplers: 2                      # Concurrent LLM threads
+max_samples: 100
+num_samplers: 3                      # Concurrent LLM threads
 num_evaluators: 3                    # Persistent sandbox processes
 
 # =====================================================================
 # Checkpointing (saves are incremental via SQLite — no interval needed)
 # =====================================================================
 # save_ckpt_dir:     # Auto-derived from log_dir if omitted
-# resume_from_ckpt:  # Set to checkpoint dir/file path to resume
+resume_from_ckpt: examples/log/0224_1 # Set to checkpoint dir/file path to resume
 
 # =====================================================================
 # LLM sampler
@@ -29,7 +29,7 @@ sampler:
   max_retries: 5
   retry_delay_seconds: 5.0
   request_timeout_seconds: 180
-  cost_per_ktoken: [0.006, 0.024]    # Cost per 1K tokens (input, output) for tracking
+  cost_per_ktoken: [0.0008, 0.0008]    # Cost per 1K tokens (input, output) for tracking
 
 # =====================================================================
 # Evolutionary algorithm / database

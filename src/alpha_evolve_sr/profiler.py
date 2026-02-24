@@ -9,7 +9,8 @@ import time
 
 import matplotlib.pyplot as plt
 from tensorboard.compat.proto.event_pb2 import Event
-from tensorboard.compat.proto.summary_pb2 import Summary
+from tensorboard.compat.proto.summary_pb2 import Summary, SummaryMetadata
+from tensorboard.plugins.custom_scalar import layout_pb2, metadata as cs_metadata
 from tensorboard.summary.writer.event_file_writer import EventFileWriter
 
 from .logging_config import get_logger
@@ -96,13 +97,74 @@ class ProfileMetrics:
 class TensorBoardWriter:
     """Wraps all ``SummaryWriter`` operations."""
 
-    def __init__(self, log_dir: str):
+    def __init__(self, log_dir: str, num_islands: int = 10):
         self._writer: SummaryWriter | None = None
         self._log_dir = log_dir
+        self._num_islands = num_islands
         self._init_writer()
 
     def _init_writer(self) -> None:
         self._writer = SummaryWriter(log_dir=self._log_dir)
+        self._write_custom_scalars_layout()
+
+    def _write_custom_scalars_layout(self) -> None:
+        """Write a Custom Scalars layout so TensorBoard overlays related metrics."""
+        # --- Island chart groups (5 per chart) ---
+        score_charts: list[layout_pb2.Chart] = []
+        size_charts: list[layout_pb2.Chart] = []
+        for start in range(0, self._num_islands, 5):
+            end = min(start + 5, self._num_islands)
+            island_ids = list(range(start, end))
+            score_charts.append(layout_pb2.Chart(
+                title=f"Islands {start}\u2013{end - 1}",
+                multiline=layout_pb2.MultilineChartContent(
+                    tag=[f"Best Score / Island/island_{i}" for i in island_ids],
+                ),
+            ))
+            size_charts.append(layout_pb2.Chart(
+                title=f"Islands {start}\u2013{end - 1}",
+                multiline=layout_pb2.MultilineChartContent(
+                    tag=[f"Island Size/island_{i}" for i in island_ids],
+                ),
+            ))
+
+        layout = layout_pb2.Layout(category=[
+            layout_pb2.Category(
+                title="Time",
+                chart=[layout_pb2.Chart(
+                    title="Sample vs Evaluate Time",
+                    multiline=layout_pb2.MultilineChartContent(tag=[
+                        "Total Sample/Evaluate Time/sample time",
+                        "Total Sample/Evaluate Time/evaluate time",
+                    ]),
+                )],
+            ),
+            layout_pb2.Category(
+                title="Function Quality",
+                chart=[layout_pb2.Chart(
+                    title="Legal vs Illegal",
+                    multiline=layout_pb2.MultilineChartContent(tag=[
+                        "Legal/Illegal Function/legal function num",
+                        "Legal/Illegal Function/illegal function num",
+                    ]),
+                )],
+            ),
+            layout_pb2.Category(title="Island Scores", chart=score_charts),
+            layout_pb2.Category(title="Island Sizes", chart=size_charts),
+        ])
+
+        plugin_data = SummaryMetadata.PluginData(
+            plugin_name=cs_metadata.PLUGIN_NAME,
+            content=layout.SerializeToString(),
+        )
+        summary = Summary(value=[
+            Summary.Value(
+                tag=cs_metadata.CONFIG_SUMMARY_TAG,
+                metadata=SummaryMetadata(plugin_data=plugin_data),
+            ),
+        ])
+        event = Event(summary=summary, wall_time=time.time())
+        self._writer._writer.add_event(event)
 
     def write(self, metrics: ProfileMetrics) -> None:
         """Write all metrics to TensorBoard.

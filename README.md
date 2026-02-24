@@ -65,28 +65,12 @@ tests/
 | Scenario | Command | Description |
 |----------|---------|-------------|
 | **Fresh start** | `alpha-evolve-sr --config config.yaml` | Start a new experiment |
-| **Resume** | `alpha-evolve-sr --resume <log_dir>` | Resume using config saved in checkpoint DB |
-| **Resume + new config** | `alpha-evolve-sr --config new.yaml --resume <log_dir>` | Resume with updated config |
-
-- `--resume` points to the directory containing `checkpoint.db` (by default, `log_dir`).
-- When using `--resume` alone, the config is loaded from the checkpoint database — no `--config` needed.
-- When using both, the new config overrides the old one (structural fields like `num_islands` and `complexity_bin_size` must match).
+| **Resume + new config** | `alpha-evolve-sr --config new.yaml` | Resume with updated config |
 
 ```bash
 # Monitor with TensorBoard
 tensorboard --logdir <log_dir> --port 6006
 ```
-
-## Testing
-
-| Command | What it does |
-|---------|-------------|
-| `pytest tests/ -v` | Unit tests only (integration skipped) |
-| `pytest tests/test_integration.py -m slow -v` | Integration tests against live LLM |
-
-Integration tests log progress in real time. After a run, inspect with:
-
-    tensorboard --logdir <log_dir printed at test start>
 
 ## Documentation
 

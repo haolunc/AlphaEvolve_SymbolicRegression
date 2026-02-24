@@ -62,7 +62,7 @@ class QwenProvider(LLMProvider):
         )
 
     def generate(self, prompt: str, config: SamplerConfig) -> LLMResponse:
-        model = config.model_name or "qwen3-max"
+        model = config.model_name or "qwen3.5-plus"
 
         kwargs: dict = {
             "model": model,

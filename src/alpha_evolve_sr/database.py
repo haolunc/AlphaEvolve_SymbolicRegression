@@ -221,7 +221,7 @@ class ProgramsDatabase:
         self._tot_sample_time: float = 0.0
         self._tot_evaluate_time: float = 0.0
         self._tot_token_cost: float = 0.0
-        self._tb_writer = profiler.TensorBoardWriter(log_dir)
+        self._tb_writer = profiler.TensorBoardWriter(log_dir, num_islands=config.num_islands)
         self._global_sample_nums = 0
 
         # Pareto front: lightweight entries sorted by cbin
@@ -435,6 +435,11 @@ class ProgramsDatabase:
 
         # 1. Sample gsns from in-memory island (fast)
         gsns = self._islands[island_id].sample_gsns(temperature, pareto)
+        logger.info(
+            "get_prompt: island=%d, len(gsns)=%d",
+            island_id,
+            len(gsns),
+        )
 
         # 2. Load full programs from DB (only for prompt text generation)
         programs = self._checkpoint_db.load_programs_by_ids(gsns)
@@ -491,6 +496,12 @@ class ProgramsDatabase:
         and optional ``SampleMessage``, then routes it to the appropriate island(s).
         """
         self._global_sample_nums += 1
+        if self._global_sample_nums % 10 == 0:
+            logger.info(
+                "Global sample count reached %d / %d",
+                self._global_sample_nums,
+                self._max_samples,
+            )
 
         island_id = sample_message.island_id if sample_message else None
         sample_time = sample_message.sample_time if sample_message else None
@@ -546,7 +557,6 @@ class ProgramsDatabase:
                 if score > self._best_score_per_island[iid]:
                     self._best_score_per_island[iid] = score
                     self._best_program_per_island[iid] = (gsn, score, complexity)
-                    logger.info("Best score of island %d increased to %s", iid, score)
 
             self._update_pareto_front(evaluated)
 

@@ -65,7 +65,8 @@ def _attach_complexity(eval_result: EvalResult) -> EvalResult:
     try:
         c_val, c_detail = complexity_score(str(eval_result.function), return_breakdown=True)
     except Exception as e:
-        c_val, c_detail = None, {}
+        c_val, c_detail = 200, {"error": f"Complexity evaluation failed: {e}"}
+        logger.warning("Complexity evaluation failed: %s", e)
         return dataclasses.replace(
             eval_result, complexity=c_val, complexity_detail=c_detail,
             error_type=eval_result.error_type or "complexity",
@@ -178,6 +179,8 @@ def run_pipeline(
                     "Cannot start without a valid seed program."
                 )
             initial_result = _attach_complexity(initial_result)
+            logger.info("Initial seed evaluation complete: execution_score=%s, complexity=%s",
+                initial_result.execution_result.score, initial_result.complexity)
 
         database = ProgramsDatabase.restore_or_create(
             run_config.database, prompt_text, run_config.log_dir,
@@ -208,6 +211,21 @@ def run_pipeline(
                             eval_result, sample_msg = fut.result()
                             eval_result = _attach_complexity(eval_result)
                             database.register_program(eval_result, sample_msg)
+                            if eval_result.execution_result is not None:
+                                logger.info(
+                                    "Eval success: score=%.6g, complexity=%s, eval_time=%.2fs, gsn=%d",
+                                    eval_result.execution_result.score,
+                                    eval_result.complexity,
+                                    eval_result.evaluate_time,
+                                    database.sample_count,
+                                )
+                            else:
+                                logger.info(
+                                    "Eval failed: error_type=%s, error=%s, gsn=%d",
+                                    eval_result.error_type,
+                                    eval_result.error_message,
+                                    database.sample_count,
+                                )
                         except Exception as e:
                             logger.error("Eval worker error: %s", e)
                 pending_eval_futures -= done_eval_futures
@@ -220,6 +238,13 @@ def run_pipeline(
                         try:
                             msg = fut.result()
                             if msg is not None:
+                                logger.info(
+                                    "Sample completed: island=%d, tokens=(%d,%d), time=%.2fs",
+                                    msg.island_id,
+                                    msg.llm_response.input_tokens,
+                                    msg.llm_response.output_tokens,
+                                    msg.sample_time,
+                                )
                                 ef = eval_pool.submit(_eval_thread_analyse, msg)
                                 pending_eval_futures.add(ef)
                         except Exception as e:

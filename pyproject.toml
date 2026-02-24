@@ -20,6 +20,7 @@ dependencies = [
     "python-dotenv",
     "pyyaml",
     "tensorboard",
+    "setuptools<82",  # tensorboard imports pkg_resources, removed in 82
 ]
 
 [project.optional-dependencies]
