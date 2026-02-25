@@ -170,7 +170,7 @@ Key details:
 `get_prompt()` builds the LLM prompt from sampled programs:
 
 1. **Pick island** -- uniform random over all islands.
-2. **Compute temperature** -- cyclic linear decay (see [Two-Stage Sampling](introduction.md#two-stage-sampling)).
+2. **Compute temperature** -- cyclic linear decay (see [Two-Stage Sampling](two-stage-sampling)).
 3. **Sample GSNs** -- `island.sample_gsns(temperature, pareto_front)` returns `k` global sample numbers.
 4. **Load bodies** -- `checkpoint_db.load_bodies_by_ids(gsns)` fetches function bodies and scores from SQLite.
 5. **Sort** -- ascending by score (worst-to-best), so the LLM sees a progression.
@@ -184,7 +184,7 @@ Returns a `Prompt(code, island_id)` message.
 
 ## Two-Stage Sampling
 
-Sampling happens inside `Island.sample_gsns()`. For full mathematical details, see the [introduction](introduction.md#two-stage-sampling).
+Sampling happens inside `Island.sample_gsns()`. For full mathematical details, see the [introduction](two-stage-sampling).
 
 **Stage 1 -- Bin selection**: pick $k$ bins ($k$ = `functions_per_prompt`).
 

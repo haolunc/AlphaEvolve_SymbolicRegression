@@ -15,49 +15,26 @@ The pipeline uses a **thread + subprocess** hybrid with a single orchestrating m
 flowchart TB
     subgraph main ["Main Thread (orchestrator)"]
         direction TB
-        DB["ProgramsDatabase\n(register, get_prompt)"]
-        CX["_attach_complexity()"]
+        DB["ProgramsDatabase"]
+        LOOP(("Event Loop<br/>50 ms poll"))
         TB_["TensorBoardWriter"]
-        LOOP["Event Loop\n(50 ms polling)"]
     end
 
-    subgraph spool ["ThreadPoolExecutor (num_samplers)"]
-        S1["Thread 1\n_sampler_task()"]
-        S2["Thread 2\n_sampler_task()"]
-        SN["Thread N\n_sampler_task()"]
+    subgraph spool ["Sampler Pool (&times; N threads)"]
+        ST["_sampler_task()<br/>LLM API call"]
     end
 
-    subgraph epool ["ThreadPoolExecutor (num_evaluators)"]
-        E1["Thread 1\n_eval_thread_analyse()"]
-        E2["Thread 2\n_eval_thread_analyse()"]
-        EM["Thread M\n_eval_thread_analyse()"]
-
-        E1 --- SB1["Sandbox\n(mp.Pool 1)"]
-        E2 --- SB2["Sandbox\n(mp.Pool 1)"]
-        EM --- SBM["Sandbox\n(mp.Pool 1)"]
+    subgraph epool ["Evaluator Pool (&times; M threads)"]
+        ET["_eval_thread_analyse()<br/>Evaluator + Sandbox(mp.Pool(1))"]
     end
 
-    LOOP -->|"1. get_prompt()"| DB
-    DB -->|"Prompt"| LOOP
-    LOOP -->|"2. submit(_sampler_task)"| S1
-    LOOP -->|"2. submit(_sampler_task)"| S2
-    LOOP -->|"2. submit(_sampler_task)"| SN
-
-    S1 -->|"Future[SampleMessage]"| LOOP
-    S2 -->|"Future[SampleMessage]"| LOOP
-    SN -->|"Future[SampleMessage]"| LOOP
-
-    LOOP -->|"3. submit(_eval_thread_analyse)"| E1
-    LOOP -->|"3. submit(_eval_thread_analyse)"| E2
-    LOOP -->|"3. submit(_eval_thread_analyse)"| EM
-
-    E1 -->|"Future[(EvalResult,\nSampleMessage)]"| LOOP
-    E2 -->|"Future[(EvalResult,\nSampleMessage)]"| LOOP
-    EM -->|"Future[(EvalResult,\nSampleMessage)]"| LOOP
-
-    LOOP -->|"4. _attach_complexity()"| CX
-    LOOP -->|"5. register_program()"| DB
-    DB -->|"ProfileMetrics"| TB_
+    DB -- "get_prompt()" --> LOOP
+    LOOP -- "submit" --> ST
+    ST -. "SampleMessage" .-> LOOP
+    LOOP -- "submit" --> ET
+    ET -. "EvalResult +<br/>SampleMessage" .-> LOOP
+    LOOP -- "_attach_complexity()<br/>register_program()" --> DB
+    DB -- "ProfileMetrics" --> TB_
 ```
 
 **Three layers:**
