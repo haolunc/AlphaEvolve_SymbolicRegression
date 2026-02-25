@@ -32,7 +32,7 @@ def db(tmp_path):
     log_dir = str(tmp_path / "logs")
 
     from alpha_evolve_sr.database import ProgramsDatabase
-    database = ProgramsDatabase(config, SAMPLE_PROMPT, log_dir)
+    database = ProgramsDatabase(config, SAMPLE_PROMPT, log_dir, seed_function=SAMPLE_SEED_FUNCTION)
 
     database.register_program(*_make_result(SAMPLE_SEED_FUNCTION, island_id=None, score=-1.0, complexity=5))
     return database
@@ -173,7 +173,7 @@ class TestParetoFront:
             pareto_aware=True,
         )
         from alpha_evolve_sr.database import ProgramsDatabase
-        database = ProgramsDatabase(config, SAMPLE_PROMPT, str(tmp_path / "logs"))
+        database = ProgramsDatabase(config, SAMPLE_PROMPT, str(tmp_path / "logs"), seed_function=SAMPLE_SEED_FUNCTION)
 
         # Register a few programs with different complexities to build a Pareto front
         for c, s in [(5, -1.0), (15, -0.5), (25, -0.3)]:

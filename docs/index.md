@@ -10,12 +10,13 @@ Inspired by [FunSearch](https://www.nature.com/articles/s41586-023-06924-6) (Nat
 :maxdepth: 2
 
 introduction
-getting-started
 architecture/pipeline
-architecture/data-flow
 architecture/input-files
 architecture/config
 architecture/evaluator
 architecture/sampler
+architecture/database
 architecture/messages
+architecture/checkpoint
+architecture/profiler
 ```

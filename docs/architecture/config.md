@@ -13,19 +13,21 @@ All configuration lives in a single YAML file, parsed by `RunConfig.from_yaml()`
 
 ```python
 run_config = RunConfig.from_yaml("my_config.yaml")
+run_config.validate()
 ```
 
 The YAML file has top-level scalar fields plus nested sections (`sampler`, `database`, `evaluator`) that map to frozen dataclasses. Unknown keys in nested sections are warned and ignored; unknown top-level keys raise `ValueError`.
 
-> **Backward compatibility:** The deprecated keys `distributed` and `worker` are silently ignored with a `DeprecationWarning`.
-
-> **Note:** `RunConfig` is the only mutable config dataclass. `__post_init__` normalizes `resume_from_ckpt` and defaults `save_ckpt_dir` from `log_dir`.
+```{note}
+`RunConfig` is the only **mutable** config dataclass (`@dataclass` without `frozen=True`).
+Its `__post_init__` normalizes `resume_from_ckpt` (directory to `checkpoint.db`) and defaults `save_ckpt_dir` from `log_dir`.
+```
 
 ---
 
 ## Full Example
 
-```{literalinclude} ../../examples/my_config.yaml
+```{literalinclude} ../../examples/my_configs/my_config_0224_5.yaml
 :language: yaml
 ```
 
@@ -39,13 +41,13 @@ Top-level pipeline configuration.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `problem_dir` | `str \| None` | `None` | Path to the problem directory (prompt.txt, equation.py, evaluate.py) |
-| `data_folder` | `str \| None` | `None` | Path to the training data directory (train.csv) |
-| `log_dir` | `str \| None` | `None` | Path to the log directory |
+| `problem_dir` | `str \| None` | `None` | Path to the problem directory (`prompt.txt`, `equation.py`, `evaluate.py`) |
+| `data_folder` | `str \| None` | `None` | Path to the training data directory (`train.csv`) |
+| `log_dir` | `str \| None` | `None` | Path to the log / TensorBoard directory |
 | `max_samples` | `int` | `3600` | Stop after this many total evaluations |
 | `num_samplers` | `int` | `8` | Number of concurrent LLM sampler threads |
-| `num_evaluators` | `int` | `8` | Number of evaluator worker processes |
-| `save_ckpt_dir` | `str \| None` | `None` | Directory for checkpoints (defaults to `log_dir`) |
+| `num_evaluators` | `int` | `8` | Number of threads, each with a thread-local `Evaluator` + `Sandbox(mp.Pool(1))` |
+| `save_ckpt_dir` | `str \| None` | `None` | Directory for checkpoints (defaults to `log_dir` if omitted) |
 | `resume_from_ckpt` | `str \| None` | `None` | Path to a checkpoint file or directory to resume from |
 
 Nested configs (each described below):
@@ -56,11 +58,20 @@ Nested configs (each described below):
 | `database` | `ProgramsDatabaseConfig` |
 | `evaluator` | `EvaluatorConfig` |
 
+**Methods:**
+
+| Method | Description |
+|--------|-------------|
+| `from_yaml(path)` | Load config from a YAML file |
+| `from_yaml_text(yaml_text)` | Parse config from a YAML string |
+| `to_yaml(path)` | Serialize config to a YAML file |
+| `validate()` | Raise `ValueError` if required paths are missing or invalid |
+
 ---
 
 ### ProgramsDatabaseConfig
 
-Evolutionary algorithm parameters.
+Evolutionary algorithm parameters. Frozen dataclass.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -72,14 +83,14 @@ Evolutionary algorithm parameters.
 | `complexity_bin_size` | `int` | `10` | Width of each complexity bin |
 | `cluster_max_size` | `int` | `100` | Maximum programs per cluster before pruning |
 | `pareto_aware` | `bool` | `False` | Weight cluster selection by Pareto improvement potential |
-| `checkpoint_interval` | `int` | `10` | Save checkpoint every N registered programs |
+| `checkpoint_interval` | `int` | `10` | Save derived checkpoint tables every N registered programs |
 | `log_frequency` | `int` | `25` | Write detailed TensorBoard logs every N samples |
 
 ---
 
 ### SamplerConfig
 
-LLM request parameters.
+LLM request parameters. Frozen dataclass.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -89,14 +100,14 @@ LLM request parameters.
 | `max_retries` | `int` | `5` | Maximum retry attempts per request |
 | `retry_delay_seconds` | `float` | `5.0` | Delay between retries |
 | `request_timeout_seconds` | `int` | `180` | Timeout for a single LLM request |
-| `samples_per_prompt` | `int` | `1` | Number of completions to draw per prompt (sequential) |
+| `samples_per_prompt` | `int` | `1` | Number of separate LLM futures the pipeline submits per prompt (each is an independent request) |
 | `cost_per_ktoken` | `list[float]` | `[0.006, 0.024]` | Cost per 1K tokens `[input, output]` for tracking |
 
 ---
 
 ### EvaluatorConfig
 
-Sandbox execution parameters.
+Sandbox execution parameters. Frozen dataclass.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

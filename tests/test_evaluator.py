@@ -207,6 +207,40 @@ class TestEvaluator:
         assert not hasattr(result, "sample_time")
         assert not hasattr(result, "sample_token_usage")
 
+    def test_analyse_returns_error_when_evaluate_returns_none(self):
+        """analyse() returns error_type='execution' when evaluate() returns None."""
+        # evaluate_code where evaluate() calls equation() and propagates None
+        eval_code = (
+            "import numpy as np\n"
+            "def evaluate(data):\n"
+            "    result = equation(data['x'], [1.0])\n"
+            "    return result\n"
+        )
+        eval_inst = Evaluator(
+            evaluate_code=eval_code,
+            seed_function=SAMPLE_SEED_FUNCTION,
+            data_dict={"x": __import__("numpy").array([1.0, 2.0, 3.0])},
+        )
+        try:
+            sample_msg = SampleMessage(
+                llm_response=LLMResponse(
+                    response_text="```python\ndef equation(x, params):\n    return None\n```",
+                    input_tokens=10,
+                    output_tokens=20,
+                    token_cost=0.001,
+                ),
+                island_id=0,
+                sample_time=0.5,
+            )
+            result = eval_inst.analyse(sample_msg)
+            assert isinstance(result, EvalResult)
+            assert result.execution_result is None
+            assert result.error_type == "execution"
+            assert result.error_message is not None
+            assert "None" in result.error_message
+        finally:
+            eval_inst.clean()
+
     def test_clean_is_idempotent(self, evaluator):
         """Calling clean() multiple times should not raise."""
         evaluator.clean()

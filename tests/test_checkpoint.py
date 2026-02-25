@@ -1,12 +1,13 @@
-"""Tests for SQLite-backed CheckpointDB."""
+"""Tests for SQLite-backed CheckpointDB and LogsDB."""
 
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
-from alpha_evolve_sr.checkpoint import CheckpointDB
-from alpha_evolve_sr.code_manipulation import EvaluatedProgram, ParsedFunction
-from alpha_evolve_sr.config import ProgramsDatabaseConfig, RunConfig, SamplerConfig
+from alpha_evolve_sr.checkpoint import CheckpointDB, LogsDB
+from alpha_evolve_sr.code_manipulation import ParsedFunction
+
 from alpha_evolve_sr.database import ParetoEntry
 from tests.conftest import make_evaluated_program
 
@@ -37,34 +38,30 @@ class TestCheckpointDB:
         db = CheckpointDB(":memory:")
         with db.transaction():
             db.insert_program(make_evaluated_program(1, score=-0.5))
-        programs = db.load_programs()
-        assert 1 in programs
+        data = db.load_bodies_by_ids([1])
+        assert 1 in data
         db.close()
 
     def test_insert_and_load_program(self, checkpoint_db):
         prog = make_evaluated_program(1, score=-0.5, complexity=10)
         with checkpoint_db.transaction():
-            checkpoint_db.insert_program(prog, llm_response_text="return x * 2")
-        programs = checkpoint_db.load_programs()
-        assert 1 in programs
-        loaded = programs[1]
-        assert loaded.score == -0.5
-        assert loaded.complexity == 10
-        assert loaded.parsed.name == "equation"
-        assert loaded.optimized_params == [1.0, 2.0]
-        assert loaded.token_usage == (10, 20)
+            checkpoint_db.insert_program(prog)
+        data = checkpoint_db.load_bodies_by_ids([1])
+        assert 1 in data
+        body, score = data[1]
+        assert score == -0.5
+        assert "return" in body
 
     def test_insert_program_none_fields(self, checkpoint_db):
-        """Program with None score/complexity/params should round-trip."""
+        """Program with None score/complexity should round-trip."""
         parsed = ParsedFunction(name="f", args="x", body="    return x")
-        prog = EvaluatedProgram(parsed=parsed, global_sample_nums=1)
+        prog = SimpleNamespace(parsed=parsed, global_sample_nums=1, score=None)
         with checkpoint_db.transaction():
             checkpoint_db.insert_program(prog)
-        loaded = checkpoint_db.load_programs()[1]
-        assert loaded.score is None
-        assert loaded.complexity is None
-        assert loaded.optimized_params is None
-        assert loaded.token_usage is None
+        data = checkpoint_db.load_bodies_by_ids([1])
+        assert 1 in data
+        _body, score = data[1]
+        assert score is None
 
     def test_island_bins_roundtrip(self, checkpoint_db):
         """checkpoint_island_bins + load_island_index round-trip."""
@@ -139,13 +136,13 @@ class TestCheckpointDB:
     def test_island_stats_roundtrip(self, checkpoint_db):
         with checkpoint_db.transaction():
             checkpoint_db.save_island_stats([
-                (0, 5, -0.5, 10),
-                (1, 3, float("-inf"), None),
+                (0, 5, -0.5, 10, 7),
+                (1, 3, float("-inf"), None, None),
             ])
         stats = checkpoint_db.load_island_stats()
         assert len(stats) == 2
-        assert stats[0] == {"island_id": 0, "size": 5, "best_score": -0.5, "best_gsn": 10}
-        assert stats[1] == {"island_id": 1, "size": 3, "best_score": float("-inf"), "best_gsn": None}
+        assert stats[0] == {"island_id": 0, "size": 5, "best_score": -0.5, "best_gsn": 10, "best_complexity": 7}
+        assert stats[1] == {"island_id": 1, "size": 3, "best_score": float("-inf"), "best_gsn": None, "best_complexity": None}
 
     def test_is_populated(self, checkpoint_db):
         assert not checkpoint_db.is_populated
@@ -165,19 +162,15 @@ class TestCheckpointDB:
                 raise ValueError("test rollback")
         except ValueError:
             pass
-        assert checkpoint_db.load_programs() == {}
+        assert checkpoint_db.load_bodies_by_ids([1]) == {}
 
     def test_roundtrip_close_reopen(self, tmp_path):
         """Data persists after close and reopen."""
         db_path = str(tmp_path / "test.db")
         db = CheckpointDB(db_path)
-        run_config = RunConfig(
-            problem_dir="specs/test", data_folder="data/test",
-            log_dir="test_run", max_samples=100,
-        )
         with db.transaction():
             db.insert_program(make_evaluated_program(1, score=-0.3))
-            db.save_run_config(run_config, num_islands=5, complexity_bin_size=10)
+            db.save_run_config(num_islands=5, complexity_bin_size=10)
             db.save_global_stats(
                 global_sample_num=1, last_reset_step=1, best_score=-0.3,
                 success_count=1, failed_count=0,
@@ -187,9 +180,9 @@ class TestCheckpointDB:
 
         db2 = CheckpointDB(db_path)
         assert db2.is_populated
-        progs = db2.load_programs()
-        assert 1 in progs
-        assert progs[1].score == -0.3
+        data = db2.load_bodies_by_ids([1])
+        assert 1 in data
+        assert data[1][1] == -0.3
         stats = db2.load_global_stats()
         assert stats["global_sample_num"] == 1
         db2.close()
@@ -197,40 +190,6 @@ class TestCheckpointDB:
     def test_checkpoint_error_on_bad_path(self):
         with pytest.raises(OSError, match="Failed to open"):
             CheckpointDB("/nonexistent/deeply/nested/path/that/cannot/exist/test.db")
-
-    def test_decorator_persistence(self, checkpoint_db):
-        """Decorators survive insert → load round-trip."""
-        parsed = ParsedFunction(
-            name="equation", args="x, params", body="    return x",
-            decorators=("jax.jit",),
-        )
-        prog = EvaluatedProgram(parsed=parsed, global_sample_nums=1)
-        with checkpoint_db.transaction():
-            checkpoint_db.insert_program(prog)
-        loaded = checkpoint_db.load_programs()[1]
-        assert loaded.parsed.decorators == ("jax.jit",)
-
-    def test_decorator_persistence_empty(self, checkpoint_db):
-        """Programs with no decorators round-trip as empty tuple."""
-        parsed = ParsedFunction(name="f", args="x", body="    return x")
-        prog = EvaluatedProgram(parsed=parsed, global_sample_nums=1)
-        with checkpoint_db.transaction():
-            checkpoint_db.insert_program(prog)
-        loaded = checkpoint_db.load_programs()[1]
-        assert loaded.parsed.decorators == ()
-
-    def test_load_programs_by_ids(self, checkpoint_db):
-        with checkpoint_db.transaction():
-            checkpoint_db.insert_program(make_evaluated_program(1, score=-1.0))
-            checkpoint_db.insert_program(make_evaluated_program(2, score=-0.5))
-            checkpoint_db.insert_program(make_evaluated_program(3, score=-0.3))
-        result = checkpoint_db.load_programs_by_ids([1, 3])
-        assert set(result.keys()) == {1, 3}
-        assert result[1].score == -1.0
-        assert result[3].score == -0.3
-
-        # Empty list returns empty dict
-        assert checkpoint_db.load_programs_by_ids([]) == {}
 
 
 class TestRunConfig:
@@ -242,32 +201,17 @@ class TestRunConfig:
 
     def test_save_load_roundtrip(self, checkpoint_db):
         """save_run_config + load_run_config should round-trip structural fields."""
-        run_config = RunConfig(
-            problem_dir="specs/test",
-            data_folder="data/test",
-            log_dir="test_run",
-            max_samples=100,
-            num_samplers=4,
-            num_evaluators=2,
-            sampler=SamplerConfig(provider="openai", temperature=0.5),
-            database=ProgramsDatabaseConfig(num_islands=5, reset_period=200),
-        )
         with checkpoint_db.transaction():
-            checkpoint_db.save_run_config(run_config, num_islands=5, complexity_bin_size=10)
+            checkpoint_db.save_run_config(num_islands=5, complexity_bin_size=10)
 
         stored = checkpoint_db.load_run_config()
         assert stored is not None
         assert stored["num_islands"] == 5
         assert stored["complexity_bin_size"] == 10
-        assert "problem_dir" in stored["config_yaml"]
 
     def test_validate_config_passes_on_match(self, checkpoint_db):
-        run_config = RunConfig(
-            problem_dir="specs/test", data_folder="data/test", log_dir="test",
-            database=ProgramsDatabaseConfig(num_islands=5, complexity_bin_size=10),
-        )
         with checkpoint_db.transaction():
-            checkpoint_db.save_run_config(run_config, num_islands=5, complexity_bin_size=10)
+            checkpoint_db.save_run_config(num_islands=5, complexity_bin_size=10)
         # Should not raise
         checkpoint_db.validate_config(num_islands=5, complexity_bin_size=10)
 
@@ -278,12 +222,8 @@ class TestRunConfig:
     ])
     def test_validate_config_fails_on_mismatch(self, tmp_path, saved, query, match):
         db = CheckpointDB(str(tmp_path / "test.db"))
-        run_config = RunConfig(
-            problem_dir="specs/test", data_folder="data/test", log_dir="test",
-            database=ProgramsDatabaseConfig(**saved),
-        )
         with db.transaction():
-            db.save_run_config(run_config, **saved)
+            db.save_run_config(**saved)
         with pytest.raises(ValueError, match=match):
             db.validate_config(**query)
         db.close()
@@ -294,67 +234,63 @@ class TestRunConfig:
         checkpoint_db.validate_config(num_islands=5, complexity_bin_size=10)
 
 
-class TestEvalOutput:
+class TestLogsDB:
     @pytest.fixture
-    def checkpoint_db(self, tmp_path):
-        db = CheckpointDB(str(tmp_path / "test.db"))
+    def logs_db(self, tmp_path):
+        db = LogsDB(str(tmp_path / "logs.db"))
         yield db
         db.close()
 
-    def test_eval_output_roundtrip(self, checkpoint_db):
-        """eval_output survives insert → load round-trip."""
-        prog = make_evaluated_program(1, eval_output="CMA-ES: iter 1\nscore=-0.5\n")
-        with checkpoint_db.transaction():
-            checkpoint_db.insert_program(prog)
-        loaded = checkpoint_db.load_programs()[1]
-        assert loaded.eval_output == "CMA-ES: iter 1\nscore=-0.5\n"
-
-    def test_eval_output_none_roundtrip(self, checkpoint_db):
-        """eval_output=None survives insert → load round-trip."""
-        prog = make_evaluated_program(1)
-        with checkpoint_db.transaction():
-            checkpoint_db.insert_program(prog)
-        loaded = checkpoint_db.load_programs()[1]
-        assert loaded.eval_output is None
-
-    def test_schema_migration_adds_eval_output(self, tmp_path):
-        """Opening a DB without eval_output column triggers migration."""
-        db_path = str(tmp_path / "old.db")
-        # Create a DB with the old schema (no eval_output column)
-        conn = sqlite3.connect(db_path)
-        conn.executescript("""\
-            CREATE TABLE programs (
-                global_sample_num   INTEGER PRIMARY KEY,
-                func_name           TEXT    NOT NULL,
-                func_args           TEXT    NOT NULL,
-                func_body           TEXT    NOT NULL,
-                func_return_type    TEXT,
-                func_docstring      TEXT,
-                func_decorators     TEXT,
-                score               REAL,
-                optimized_params    TEXT,
-                complexity          INTEGER,
-                complexity_detail   TEXT,
-                sample_time         REAL,
-                evaluate_time       REAL,
-                token_usage_input   INTEGER,
-                token_usage_output  INTEGER,
-                token_cost          REAL,
-                llm_response_text   TEXT,
-                error_type          TEXT,
-                error_message       TEXT
-            );
-        """)
-        conn.execute(
-            "INSERT INTO programs VALUES (1,'f','x','    return x',NULL,NULL,NULL,"
-            "-1.0,NULL,5,NULL,0.1,0.2,10,20,0.001,NULL,NULL,NULL)"
+    def test_insert_and_verify(self, logs_db, tmp_path):
+        """insert_log writes all columns to the program_logs table."""
+        logs_db.insert_log(
+            global_sample_num=1,
+            llm_response_text="return x * 2",
+            error_type="ValueError",
+            error_message="bad value",
+            eval_output="CMA-ES: iter 1\n",
+            complexity=9,
+            complexity_detail='{"BinOp": 3}',
+            optimized_params='[1.0, 2.0]',
+            sample_time=0.1,
+            evaluate_time=0.2,
+            token_usage_input=10,
+            token_usage_output=20,
+            token_cost=0.001,
         )
-        conn.commit()
+        # Read back via raw SQL
+        conn = sqlite3.connect(str(tmp_path / "logs.db"))
+        row = conn.execute("SELECT * FROM program_logs WHERE global_sample_num = 1").fetchone()
         conn.close()
+        assert row == (
+            1, "return x * 2", "ValueError", "bad value", "CMA-ES: iter 1\n",
+            9, '{"BinOp": 3}', '[1.0, 2.0]', 0.1, 0.2, 10, 20, 0.001,
+        )
 
-        # Open with CheckpointDB — migration should add eval_output
-        db = CheckpointDB(db_path)
-        loaded = db.load_programs()
-        assert 1 in loaded
-        assert loaded[1].eval_output is None
+    def test_insert_none_fields(self, logs_db, tmp_path):
+        """All-None log fields should store NULLs."""
+        logs_db.insert_log(1, None, None, None, None)
+        conn = sqlite3.connect(str(tmp_path / "logs.db"))
+        row = conn.execute("SELECT * FROM program_logs WHERE global_sample_num = 1").fetchone()
+        conn.close()
+        assert row == (1, None, None, None, None, None, None, None, None, None, None, None, None)
+
+    def test_close_and_reopen(self, tmp_path):
+        """Data persists after close and reopen."""
+        db_path = str(tmp_path / "logs.db")
+        db = LogsDB(db_path)
+        db.insert_log(1, "text", None, None, "output", sample_time=0.5)
         db.close()
+
+        db2 = LogsDB(db_path)
+        conn = sqlite3.connect(db_path)
+        row = conn.execute("SELECT * FROM program_logs WHERE global_sample_num = 1").fetchone()
+        conn.close()
+        db2.close()
+        assert row[1] == "text"
+        assert row[4] == "output"
+        assert row[8] == 0.5  # sample_time
+
+    def test_error_on_bad_path(self):
+        with pytest.raises(OSError, match="Failed to open"):
+            LogsDB("/nonexistent/deeply/nested/path/that/cannot/exist/logs.db")

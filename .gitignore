@@ -19,4 +19,6 @@ docs/_build/
 .pytest_cache/
 .ruff_cache/
 outcmaes/
-examples/log1
+examples/log/
+examples/my_configs/
+
