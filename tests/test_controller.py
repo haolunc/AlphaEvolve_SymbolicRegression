@@ -8,7 +8,7 @@ import pytest
 
 from alpha_evolve_sr.config import ProgramsDatabaseConfig
 from alpha_evolve_sr.database import ProgramsDatabase
-from tests.conftest import SAMPLE_PROMPT, make_eval_result, make_sample_message
+from tests.conftest import SAMPLE_PROMPT, SAMPLE_SEED_FUNCTION, make_eval_result, make_sample_message
 
 
 @pytest.fixture
@@ -17,6 +17,7 @@ def db_lifecycle(tmp_path):
     config = ProgramsDatabaseConfig(num_islands=2, reset_period=999)
     return ProgramsDatabase.restore_or_create(
         config, SAMPLE_PROMPT, str(tmp_path / "logs"),
+        seed_function=SAMPLE_SEED_FUNCTION,
         ckpt_dir=str(tmp_path / "ckpts"), max_samples=5,
     )
 
@@ -27,6 +28,7 @@ class TestRestoreOrCreate:
         initial = make_eval_result()
         db = ProgramsDatabase.restore_or_create(
             config, SAMPLE_PROMPT, str(tmp_path / "logs"),
+            seed_function=SAMPLE_SEED_FUNCTION,
             ckpt_dir=str(tmp_path / "ckpts"), max_samples=5,
             initial_result=initial,
         )
@@ -39,7 +41,8 @@ class TestRestoreOrCreate:
         config = ProgramsDatabaseConfig(num_islands=2, reset_period=999)
         db = ProgramsDatabase.restore_or_create(
             config, SAMPLE_PROMPT, str(tmp_path / "logs"),
-            max_samples=5,
+            seed_function=SAMPLE_SEED_FUNCTION,
+            ckpt_dir=str(tmp_path / "ckpts"), max_samples=5,
         )
         assert db.sample_count == 0
 
@@ -50,6 +53,7 @@ class TestRestoreOrCreate:
 
         db = ProgramsDatabase.restore_or_create(
             config, SAMPLE_PROMPT, str(tmp_path / "logs1"),
+            seed_function=SAMPLE_SEED_FUNCTION,
             ckpt_dir=ckpt_dir, max_samples=100,
             initial_result=make_eval_result(score=-0.5),
         )
@@ -61,6 +65,7 @@ class TestRestoreOrCreate:
         # Restore from same dir
         db2 = ProgramsDatabase.restore_or_create(
             config, SAMPLE_PROMPT, str(tmp_path / "logs2"),
+            seed_function=SAMPLE_SEED_FUNCTION,
             ckpt_dir=ckpt_dir, max_samples=100,
             resume_path=os.path.join(ckpt_dir, "checkpoint.db"),
         )

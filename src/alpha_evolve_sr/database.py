@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import bisect
 import dataclasses
+import json
 import os
 from collections.abc import Sequence
 from typing import NamedTuple
@@ -29,7 +30,7 @@ import scipy
 
 from . import code_manipulation, profiler
 from . import config as config_lib
-from .checkpoint import CheckpointDB
+from .checkpoint import CheckpointDB, LogsDB
 from .logging_config import get_logger
 from .messages import EvalResult, ExecutionResult, Prompt, SampleMessage
 from .profiler import ProfileMetrics
@@ -45,10 +46,30 @@ class ParetoEntry(NamedTuple):
     gsn: int        # global_sample_num
 
 
+@dataclasses.dataclass
+class _RegisteredProgram:
+    """Internal record used while registering and persisting one program."""
+
+    parsed: code_manipulation.ParsedFunction
+    global_sample_nums: int
+    score: float | None = None
+    optimized_params: list[float] | np.ndarray | None = None
+    complexity: int | None = None
+    complexity_detail: dict | None = None
+    sample_time: float | None = None
+    evaluate_time: float | None = None
+    token_usage: tuple[int, int] | None = None
+    token_cost: float | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+    eval_output: str | None = None
+
+
 def _get_prompt_mid(new_version: int) -> str:
     return f"""
 Rules:
 - You must preserve the full function signature and docstring structure.
+- **You must preserve the return statement format** — return the same number and types of values as the original function.
 - **Only output the full definition of new version equation \
 `equation_v{new_version}`** in ```python```. **don't include any other text.**
 - **Inside the function, add inline comments explaining the physical or biological meaning of each mathematical term.**
@@ -192,11 +213,14 @@ class ProgramsDatabase:
         prompt_text: str,
         log_dir: str,
         *,
+        seed_function: code_manipulation.ParsedFunction | None = None,
         ckpt_dir: str | None = None,
         checkpoint_db: CheckpointDB | None = None,
+        logs_db: LogsDB | None = None,
         max_samples: int = 3600,
     ) -> None:
         self._config = config
+        self._seed_function = seed_function
         self._score_sampling_temperature_init = config.cluster_sampling_temperature_init
         self._score_sampling_temperature_period = config.cluster_sampling_temperature_period
         self._prompt_text = prompt_text
@@ -212,7 +236,7 @@ class ProgramsDatabase:
         ]
 
         self._best_score_per_island: list[float] = [-float("inf")] * config.num_islands
-        # (gsn, score, complexity) tuples — lightweight replacement for EvaluatedProgram
+        # (gsn, score, complexity) tuples for fast island resets.
         self._best_program_per_island: list[tuple[int, float, int] | None] = [None] * config.num_islands
 
         self._last_reset_step: int = 1
@@ -221,7 +245,7 @@ class ProgramsDatabase:
         self._tot_sample_time: float = 0.0
         self._tot_evaluate_time: float = 0.0
         self._tot_token_cost: float = 0.0
-        self._tb_writer = profiler.TensorBoardWriter(log_dir, num_islands=config.num_islands)
+        self._tb_writer = profiler.TensorBoardWriter(log_dir)
         self._global_sample_nums = 0
 
         # Pareto front: lightweight entries sorted by cbin
@@ -233,6 +257,7 @@ class ProgramsDatabase:
             self._checkpoint_db = CheckpointDB(":memory:")
         else:
             self._checkpoint_db = checkpoint_db
+        self._logs_db = logs_db
         self._max_samples = max_samples
         self._steps_since_checkpoint = 0
 
@@ -282,20 +307,16 @@ class ProgramsDatabase:
         prompt_text: str,
         log_dir: str,
         *,
+        seed_function: code_manipulation.ParsedFunction | None = None,
         ckpt_dir: str | None = None,
         max_samples: int = 3600,
         resume_path: str | None = None,
         initial_result: EvalResult | None = None,
-        run_config: config_lib.RunConfig | None = None,
     ) -> ProgramsDatabase:
         """Create a new database or restore from checkpoint.
 
         If *resume_path* is given, attempts to load from the SQLite checkpoint.
         Otherwise creates a fresh database and optionally registers *initial_result*.
-
-        Args:
-            run_config: The full RunConfig, stored in the DB on fresh start and
-                validated on resume.
         """
         import shutil
 
@@ -325,21 +346,15 @@ class ProgramsDatabase:
                         else:
                             checkpoint_db = resume_db
 
+                        logs_db = LogsDB(os.path.join(ckpt_dir, "checkpoint_logs.db")) if ckpt_dir else None
                         db = cls(
                             config, prompt_text, log_dir,
+                            seed_function=seed_function,
                             ckpt_dir=ckpt_dir, checkpoint_db=checkpoint_db,
+                            logs_db=logs_db,
                             max_samples=max_samples,
                         )
                         db._restore_from_db(checkpoint_db)
-
-                        # Update stored config YAML (allow non-structural changes)
-                        if run_config is not None:
-                            with checkpoint_db.transaction():
-                                checkpoint_db.save_run_config(
-                                    run_config,
-                                    config.num_islands,
-                                    config.complexity_bin_size,
-                                )
 
                         logger.info(
                             "Database restored from checkpoint with %d samples",
@@ -355,25 +370,26 @@ class ProgramsDatabase:
                 logger.info("No checkpoint.db found at %s, starting fresh", resume_db_path)
 
         # Fresh start
-        checkpoint_db = None
-        if ckpt_dir:
-            os.makedirs(ckpt_dir, exist_ok=True)
-            checkpoint_db = CheckpointDB(os.path.join(ckpt_dir, "checkpoint.db"))
+        os.makedirs(ckpt_dir, exist_ok=True)
+        checkpoint_db = CheckpointDB(os.path.join(ckpt_dir, "checkpoint.db"))
+        logs_db = LogsDB(os.path.join(ckpt_dir, "checkpoint_logs.db"))
 
         db = cls(
             config, prompt_text, log_dir,
-            ckpt_dir=ckpt_dir, checkpoint_db=checkpoint_db, max_samples=max_samples,
+            seed_function=seed_function,
+            ckpt_dir=ckpt_dir, checkpoint_db=checkpoint_db, logs_db=logs_db,
+            max_samples=max_samples,
         )
 
-        # Store config in DB on fresh start
-        if run_config is not None and checkpoint_db is not None:
-            with checkpoint_db.transaction():
-                checkpoint_db.save_run_config(
-                    run_config, config.num_islands, config.complexity_bin_size,
-                )
+        # Store structural config in DB on fresh start (for resume validation)
+        with checkpoint_db.transaction():
+            checkpoint_db.save_run_config(
+                config.num_islands, config.complexity_bin_size,
+            )
 
         if initial_result is not None:
             db.register_program(initial_result)
+
         return db
 
     def _restore_from_db(self, checkpoint_db: CheckpointDB) -> None:
@@ -410,11 +426,9 @@ class ProgramsDatabase:
                 self._best_score_per_island[iid] = entry["best_score"]
                 best_gsn = entry["best_gsn"]
                 if best_gsn is not None:
-                    # Load the program to get its complexity for the tuple
-                    progs = checkpoint_db.load_programs_by_ids([best_gsn])
-                    if best_gsn in progs:
-                        p = progs[best_gsn]
-                        self._best_program_per_island[iid] = (best_gsn, p.score, p.complexity)
+                    self._best_program_per_island[iid] = (
+                        best_gsn, entry["best_score"], entry["best_complexity"],
+                    )
 
     def finalize(self) -> None:
         """Flush derived data and close the checkpoint DB."""
@@ -423,6 +437,8 @@ class ProgramsDatabase:
             with self._checkpoint_db.transaction():
                 self._checkpoint_derived()
             self._checkpoint_db.close()
+        if self._logs_db:
+            self._logs_db.close()
 
     def get_prompt(self) -> Prompt:
         """Returns a prompt containing implementations from one chosen island."""
@@ -441,34 +457,34 @@ class ProgramsDatabase:
             len(gsns),
         )
 
-        # 2. Load full programs from DB (only for prompt text generation)
-        programs = self._checkpoint_db.load_programs_by_ids(gsns)
-        implementations = [programs[gsn] for gsn in gsns if gsn in programs]
-
-        # 3. Sort by score and generate prompt
-        implementations.sort(key=lambda p: p.score)
-        code = self._generate_prompt(implementations)
+        # 2. Load bodies + scores from DB (lightweight)
+        data = self._checkpoint_db.load_bodies_by_ids(gsns)
+        sorted_items = sorted(
+            [data[gsn] for gsn in gsns if gsn in data],
+            key=lambda t: t[1],  # sort by score
+        )
+        code = self._generate_prompt([body for body, _score in sorted_items])
         return Prompt(code, island_id)
 
-    def _generate_prompt(self, implementations: Sequence[code_manipulation.EvaluatedProgram]) -> str:
-        """Creates a prompt containing a sequence of function *implementations*."""
+    def _generate_prompt(self, bodies: Sequence[str]) -> str:
+        """Creates a prompt containing a sequence of function bodies."""
+        seed = self._seed_function
         versioned_functions: list[code_manipulation.ParsedFunction] = []
-        for i, impl in enumerate(implementations):
-            new_function_name = f"{self._function_to_evolve}_v{i}"
-            func = dataclasses.replace(impl.parsed, name=new_function_name)
-            if i >= 1:
-                doc = f"Improved version of `{self._function_to_evolve}_v{i - 1}`."
-                func = dataclasses.replace(func, docstring=doc)
-            renamed_code = code_manipulation.rename_function_calls(
-                str(func), self._function_to_evolve, new_function_name
+        for i, body in enumerate(bodies):
+            new_name = f"{self._function_to_evolve}_v{i}"
+            doc = (
+                f"Improved version of `{self._function_to_evolve}_v{i - 1}`."
+                if i >= 1
+                else seed.docstring
             )
-            versioned_functions.append(code_manipulation.text_to_function(renamed_code))
+            versioned_functions.append(
+                dataclasses.replace(seed, name=new_name, body=body, docstring=doc)
+            )
 
-        next_version = len(implementations)
-        new_function_name = f"{self._function_to_evolve}_v{next_version}"
+        next_version = len(bodies)
         header = dataclasses.replace(
-            implementations[-1].parsed,
-            name=new_function_name,
+            seed,
+            name=f"{self._function_to_evolve}_v{next_version}",
             body="",
             docstring=f"Improved version of `{self._function_to_evolve}_v{next_version - 1}`.",
         )
@@ -492,7 +508,7 @@ class ProgramsDatabase:
     ) -> None:
         """Registers a program in the database.
 
-        Constructs an ``EvaluatedProgram`` from the given ``EvalResult``
+        Constructs an internal registration record from the given ``EvalResult``
         and optional ``SampleMessage``, then routes it to the appropriate island(s).
         """
         self._global_sample_nums += 1
@@ -515,7 +531,7 @@ class ProgramsDatabase:
         )
 
         ex = eval_result.execution_result
-        evaluated = code_manipulation.EvaluatedProgram(
+        evaluated = _RegisteredProgram(
             parsed=eval_result.function,
             score=ex.score if ex else None,
             optimized_params=ex.optimized_params if ex else None,
@@ -536,7 +552,7 @@ class ProgramsDatabase:
 
     def _register_and_persist(
         self,
-        evaluated: code_manipulation.EvaluatedProgram,
+        evaluated: _RegisteredProgram,
         island_id: int | None,
         ex: ExecutionResult | None,
         llm_response_text: str | None,
@@ -544,7 +560,39 @@ class ProgramsDatabase:
         """Core registration + DB persistence (runs inside a transaction)."""
         db = self._checkpoint_db
         # Programs table: written every step (irreplaceable raw data)
-        db.insert_program(evaluated, llm_response_text=llm_response_text)
+        db.insert_program(evaluated)
+
+        # Log columns → separate LogsDB (outside the main transaction)
+        if self._logs_db is not None:
+            opt_params = evaluated.optimized_params
+            if opt_params is not None:
+                opt_params_json = json.dumps(
+                    opt_params.tolist() if isinstance(opt_params, np.ndarray) else opt_params,
+                )
+            else:
+                opt_params_json = None
+            complexity_detail_json = (
+                json.dumps(evaluated.complexity_detail)
+                if evaluated.complexity_detail is not None
+                else None
+            )
+            token_input = evaluated.token_usage[0] if evaluated.token_usage else None
+            token_output = evaluated.token_usage[1] if evaluated.token_usage else None
+            self._logs_db.insert_log(
+                evaluated.global_sample_nums,
+                llm_response_text,
+                evaluated.error_type,
+                evaluated.error_message,
+                evaluated.eval_output,
+                complexity=evaluated.complexity,
+                complexity_detail=complexity_detail_json,
+                optimized_params=opt_params_json,
+                sample_time=evaluated.sample_time,
+                evaluate_time=evaluated.evaluate_time,
+                token_usage_input=token_input,
+                token_usage_output=token_output,
+                token_cost=evaluated.token_cost,
+            )
 
         if ex is not None:
             gsn, score, complexity = evaluated.global_sample_nums, evaluated.score, evaluated.complexity
@@ -600,11 +648,12 @@ class ProgramsDatabase:
                 self._islands[iid].num_programs,
                 self._best_score_per_island[iid],
                 self._best_program_per_island[iid][0] if self._best_program_per_island[iid] else None,
+                self._best_program_per_island[iid][2] if self._best_program_per_island[iid] else None,
             )
             for iid in range(self._config.num_islands)
         ])
 
-    def _update_profiling_stats(self, program: code_manipulation.EvaluatedProgram) -> None:
+    def _update_profiling_stats(self, program: _RegisteredProgram) -> None:
         """Update aggregate profiling statistics with a newly evaluated *program*."""
         score = program.score
 
@@ -637,7 +686,7 @@ class ProgramsDatabase:
             wall_time_seconds=self._wall_time_seconds,
         )
 
-    def _update_pareto_front(self, program: code_manipulation.EvaluatedProgram) -> None:
+    def _update_pareto_front(self, program: _RegisteredProgram) -> None:
         """Update the Pareto front with *program* if it is non-dominated.
 
         A program is *dominated* if another entry exists with equal-or-lower

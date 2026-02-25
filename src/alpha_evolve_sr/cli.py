@@ -6,6 +6,7 @@ import argparse
 import dataclasses
 import multiprocessing as mp
 import os
+import signal
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -130,16 +131,74 @@ def _sampler_task(
 # Unified pipeline
 # ---------------------------------------------------------------------------
 
-def _cleanup_eval_threads(eval_pool: ThreadPoolExecutor) -> None:
+def _cleanup_eval_threads(eval_pool: ThreadPoolExecutor, num_workers: int) -> None:
     """Clean up Sandbox subprocesses in all evaluator threads."""
     futs = []
-    for _ in range(eval_pool._max_workers):
+    for _ in range(num_workers):
         futs.append(eval_pool.submit(lambda: _eval_tls.evaluator.clean()))
     for f in futs:
         try:
             f.result(timeout=5)
         except Exception:
             pass
+
+
+def _drain_pipeline(
+    pending_sampler_futures: set[Future],
+    pending_eval_futures: set[Future],
+    eval_pool: ThreadPoolExecutor,
+    database: ProgramsDatabase,
+    force_event: threading.Event,
+) -> None:
+    """Drain all in-flight sampler and eval futures, registering results.
+
+    Called on normal exit (max_samples reached) and on first Ctrl+C.
+    A second Ctrl+C sets *force_event*, which aborts draining immediately.
+    """
+    # Phase 1: wait for sampler futures → submit results to eval
+    for fut in list(pending_sampler_futures):
+        if force_event.is_set():
+            return
+        try:
+            msg = fut.result(timeout=120)
+            if msg is not None:
+                logger.info(
+                    "Drain sample completed: island=%d, tokens=(%d,%d), time=%.2fs",
+                    msg.island_id,
+                    msg.llm_response.input_tokens,
+                    msg.llm_response.output_tokens,
+                    msg.sample_time,
+                )
+                ef = eval_pool.submit(_eval_thread_analyse, msg)
+                pending_eval_futures.add(ef)
+        except Exception as e:
+            logger.error("Drain sampler error: %s", e)
+
+    # Phase 2: wait for all eval futures → register
+    for ef in list(pending_eval_futures):
+        if force_event.is_set():
+            return
+        try:
+            eval_result, sample_msg = ef.result(timeout=60)
+            eval_result = _attach_complexity(eval_result)
+            database.register_program(eval_result, sample_msg)
+            if eval_result.execution_result is not None:
+                logger.info(
+                    "Drain eval success: score=%.6g, complexity=%s, eval_time=%.2fs, gsn=%d",
+                    eval_result.execution_result.score,
+                    eval_result.complexity,
+                    eval_result.evaluate_time,
+                    database.sample_count,
+                )
+            else:
+                logger.info(
+                    "Drain eval failed: error_type=%s, error=%s, gsn=%d",
+                    eval_result.error_type,
+                    eval_result.error_message,
+                    database.sample_count,
+                )
+        except Exception as e:
+            logger.error("Drain eval error: %s", e)
 
 
 def run_pipeline(
@@ -184,11 +243,11 @@ def run_pipeline(
 
         database = ProgramsDatabase.restore_or_create(
             run_config.database, prompt_text, run_config.log_dir,
+            seed_function=seed_function,
             ckpt_dir=run_config.save_ckpt_dir,
             max_samples=run_config.max_samples,
             resume_path=run_config.resume_from_ckpt,
             initial_result=initial_result,
-            run_config=run_config,
         )
 
         llm = sampler_mod.LLM(config=run_config.sampler)
@@ -200,8 +259,23 @@ def run_pipeline(
 
         pipeline_start = time.time()
 
+        # -- Two-phase Ctrl+C shutdown via signal handler --
+        graceful_shutdown = threading.Event()
+        force_shutdown = threading.Event()
+        original_sigint = signal.getsignal(signal.SIGINT)
+
+        def _sigint_handler(signum, frame):  # noqa: ARG001
+            if graceful_shutdown.is_set():
+                logger.info("Second Ctrl+C: forcing immediate shutdown")
+                force_shutdown.set()
+            else:
+                logger.info("First Ctrl+C: draining in-flight work...")
+                graceful_shutdown.set()
+
+        signal.signal(signal.SIGINT, _sigint_handler)
+
         try:
-            while not database.should_stop:
+            while not database.should_stop and not graceful_shutdown.is_set():
                 # 1. Collect completed evals -> register in DB
                 done_eval_futures: set[Future] = set()
                 for fut in pending_eval_futures:
@@ -273,28 +347,28 @@ def run_pipeline(
 
                 time.sleep(0.05)  # avoid busy-wait
 
+            # --- Drain phase (normal exit & first Ctrl+C) ---
+            if not force_shutdown.is_set():
+                reason = "Ctrl+C" if graceful_shutdown.is_set() else "max_samples reached"
+                logger.info(
+                    "Pipeline stopping (%s). Draining %d samplers, %d evals...",
+                    reason, len(pending_sampler_futures), len(pending_eval_futures),
+                )
+                _drain_pipeline(
+                    pending_sampler_futures, pending_eval_futures,
+                    eval_pool, database, force_shutdown,
+                )
         except KeyboardInterrupt:
-            logger.info("KeyboardInterrupt received, shutting down pipeline")
-            # Cancel pending sampler futures
-            for fut in pending_sampler_futures:
-                fut.cancel()
-
-            # Drain remaining evals with timeout
-            deadline = time.time() + 30
-            for ef in pending_eval_futures:
-                remaining = max(0, deadline - time.time())
-                try:
-                    eval_result, sample_msg = ef.result(timeout=remaining)
-                    eval_result = _attach_complexity(eval_result)
-                    database.register_program(eval_result, sample_msg)
-                except Exception as e:
-                    logger.error("Error draining eval future during shutdown: %s", e)
+            # Safety net: if a KeyboardInterrupt slips through before the
+            # signal handler is fully installed, just force-shutdown.
+            logger.info("KeyboardInterrupt during drain, forcing shutdown")
         finally:
+            signal.signal(signal.SIGINT, original_sigint)
             sampler_pool.shutdown(wait=False, cancel_futures=True)
             llm.clean()
             database.finalize()
     finally:
-        _cleanup_eval_threads(eval_pool)
+        _cleanup_eval_threads(eval_pool, run_config.num_evaluators)
         eval_pool.shutdown(wait=False)
 
 

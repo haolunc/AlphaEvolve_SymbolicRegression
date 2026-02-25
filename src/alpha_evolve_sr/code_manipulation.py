@@ -16,12 +16,10 @@
 
 """Tools for manipulating Python code.
 
-It implements three dataclasses for representing code units:
+It implements two dataclasses for representing code units:
 
 - ``ParsedFunction`` — a frozen, immutable representation of a Python
   function's AST data (name, args, body, docstring, etc.).
-- ``EvaluatedProgram`` — a mutable container that pairs a ``ParsedFunction``
-  with evaluation / runtime metrics (score, complexity, timing, cost).
 - ``Program`` — a sequence of ``ParsedFunction`` objects together with a
   code preface (imports, globals, etc.).
 """
@@ -29,7 +27,6 @@ import ast
 import dataclasses
 import io
 import logging
-import re
 
 logger = logging.getLogger(__name__)
 
@@ -84,43 +81,6 @@ class ParsedFunction:
                 if file.tell() > 0:
                     file.write("\n")
             file.write(function_source)
-
-
-
-# ---------------------------------------------------------------------------
-# EvaluatedProgram — ParsedFunction + evaluation / runtime metrics
-# ---------------------------------------------------------------------------
-
-@dataclasses.dataclass
-class EvaluatedProgram:
-    """A ``ParsedFunction`` paired with evaluation results and runtime metadata."""
-
-    parsed: ParsedFunction
-    score: float | None = None
-    optimized_params: list[float] | None = None
-    complexity: int | None = None
-    complexity_detail: dict | None = None
-    global_sample_nums: int | None = None
-    sample_time: float | None = None
-    evaluate_time: float | None = None
-    token_usage: tuple[int, int] | None = None
-    token_cost: float | None = None
-    error_type: str | None = None
-    error_message: str | None = None
-    eval_output: str | None = None
-
-    # -- Convenience proxies so callers don't always need ``.parsed`` ------
-
-    @property
-    def name(self) -> str:
-        return self.parsed.name
-
-    def __str__(self) -> str:
-        return str(self.parsed)
-
-    def save_to_file(self, filepath: str, append: bool = False) -> None:
-        """Writes the function definition to ``filepath``."""
-        self.parsed.save_to_file(filepath, append)
 
 
 # ---------------------------------------------------------------------------
@@ -245,14 +205,3 @@ def text_to_function(text: str) -> ParsedFunction:
             f":\n{program.functions}"
         )
     return program.functions[0]
-
-
-def rename_function_calls(code: str, source_name: str, target_name: str) -> str:
-    """Renames function calls from ``source_name`` to ``target_name``."""
-    if source_name not in code:
-        return code
-    return re.sub(
-        rf"(?<!\.)\b{re.escape(source_name)}(?=\s*\()",
-        target_name,
-        code,
-    )

@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import json
 import os
 import sqlite3
 from contextlib import contextmanager
 
-import numpy as np
-
-from . import code_manipulation
-from .config import RunConfig
 from .logging_config import get_logger
 
 logger = get_logger("checkpoint")
@@ -39,25 +34,8 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS programs (
     global_sample_num   INTEGER PRIMARY KEY,
-    func_name           TEXT    NOT NULL,
-    func_args           TEXT    NOT NULL,
     func_body           TEXT    NOT NULL,
-    func_return_type    TEXT,
-    func_docstring      TEXT,
-    func_decorators     TEXT,
-    score               REAL,
-    optimized_params    TEXT,
-    complexity          INTEGER,
-    complexity_detail   TEXT,
-    sample_time         REAL,
-    evaluate_time       REAL,
-    token_usage_input   INTEGER,
-    token_usage_output  INTEGER,
-    token_cost          REAL,
-    llm_response_text   TEXT,
-    error_type          TEXT,
-    error_message       TEXT,
-    eval_output         TEXT
+    score               REAL
 );
 
 CREATE TABLE IF NOT EXISTS island_bins (
@@ -90,12 +68,12 @@ CREATE TABLE IF NOT EXISTS island_stats (
     island_id           INTEGER PRIMARY KEY,
     size                INTEGER NOT NULL DEFAULT 0,
     best_score          REAL,
-    best_gsn            INTEGER
+    best_gsn            INTEGER,
+    best_complexity     INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS run_config (
     id                  INTEGER PRIMARY KEY CHECK (id = 1),
-    config_yaml         TEXT    NOT NULL,
     num_islands         INTEGER NOT NULL,
     complexity_bin_size INTEGER NOT NULL
 );
@@ -117,18 +95,7 @@ class CheckpointDB:
         except (sqlite3.Error, OSError) as e:
             raise OSError(f"Failed to open checkpoint DB at {db_path}: {e}") from e
         self._db_path = db_path
-        self._migrate_schema()
         logger.info("CheckpointDB opened at %s", db_path)
-
-    def _migrate_schema(self) -> None:
-        """Apply forward-only schema migrations for older databases."""
-        cols = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(programs)").fetchall()
-        }
-        if "eval_output" not in cols:
-            self._conn.execute("ALTER TABLE programs ADD COLUMN eval_output TEXT")
-            logger.info("Migrated schema: added eval_output column to programs")
 
     def close(self) -> None:
         if self._conn:
@@ -149,55 +116,19 @@ class CheckpointDB:
 
     # ---- Write operations ------------------------------------------------
 
-    def insert_program(
-        self,
-        program: code_manipulation.EvaluatedProgram,
-        llm_response_text: str | None = None,
-    ) -> None:
-        token_input = program.token_usage[0] if program.token_usage else None
-        token_output = program.token_usage[1] if program.token_usage else None
-        opt_params = None
-        if program.optimized_params is not None:
-            params = program.optimized_params
-            if isinstance(params, np.ndarray):
-                params = params.tolist()
-            opt_params = json.dumps(params)
-        complexity_detail = None
-        if program.complexity_detail is not None:
-            complexity_detail = json.dumps(program.complexity_detail)
+    def insert_program(self, program) -> None:
+        """Insert a raw program row.
 
-        func_decorators_json = json.dumps(list(program.parsed.decorators)) if program.parsed.decorators else None
-
+        ``program`` must expose ``global_sample_nums``, ``parsed.body``, and ``score``.
+        """
         self._conn.execute(
             """INSERT OR REPLACE INTO programs (
-                global_sample_num, func_name, func_args, func_body,
-                func_return_type, func_docstring, func_decorators,
-                score, optimized_params,
-                complexity, complexity_detail, sample_time, evaluate_time,
-                token_usage_input, token_usage_output, token_cost,
-                llm_response_text, error_type, error_message, eval_output
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                global_sample_num, func_body, score
+            ) VALUES (?, ?, ?)""",
             (
                 program.global_sample_nums,
-                program.parsed.name,
-                program.parsed.args,
                 program.parsed.body,
-                program.parsed.return_type,
-                program.parsed.docstring,
-                func_decorators_json,
                 program.score,
-                opt_params,
-                program.complexity,
-                complexity_detail,
-                program.sample_time,
-                program.evaluate_time,
-                token_input,
-                token_output,
-                program.token_cost,
-                llm_response_text,
-                program.error_type,
-                program.error_message,
-                program.eval_output,
             ),
         )
 
@@ -253,106 +184,47 @@ class CheckpointDB:
 
     def save_island_stats(
         self,
-        island_stats: list[tuple[int, int, float | None, int | None]],
+        island_stats: list[tuple[int, int, float | None, int | None, int | None]],
     ) -> None:
         """Replace island_stats with current per-island data.
 
         Args:
-            island_stats: list of (island_id, size, best_score, best_gsn) tuples.
+            island_stats: list of (island_id, size, best_score, best_gsn, best_complexity) tuples.
         """
         self._conn.execute("DELETE FROM island_stats")
-        for island_id, size, best_score, best_gsn in island_stats:
+        for island_id, size, best_score, best_gsn, best_complexity in island_stats:
             self._conn.execute(
-                "INSERT INTO island_stats (island_id, size, best_score, best_gsn)"
-                " VALUES (?, ?, ?, ?)",
-                (island_id, size, _score_to_db(best_score), best_gsn),
+                "INSERT INTO island_stats (island_id, size, best_score, best_gsn, best_complexity)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (island_id, size, _score_to_db(best_score), best_gsn, best_complexity),
             )
 
     def save_run_config(
         self,
-        run_config: RunConfig,
         num_islands: int,
         complexity_bin_size: int,
     ) -> None:
-        """Store run config in the DB (called once on fresh start, updated on resume)."""
-        import dataclasses
-        import io
-
-        import yaml
-
-        buf = io.StringIO()
-        yaml.dump(dataclasses.asdict(run_config), buf, default_flow_style=False, sort_keys=False)
-        config_yaml = buf.getvalue()
-
+        """Store structural config in the DB (used for resume validation)."""
         self._conn.execute(
             """INSERT OR REPLACE INTO run_config (
-                id, config_yaml, num_islands, complexity_bin_size
-            ) VALUES (1, ?, ?, ?)""",
-            (config_yaml, num_islands, complexity_bin_size),
+                id, num_islands, complexity_bin_size
+            ) VALUES (1, ?, ?)""",
+            (num_islands, complexity_bin_size),
         )
 
     # ---- Read operations -------------------------------------------------
 
-    def _rows_to_programs(
-        self, rows: list[tuple],
-    ) -> dict[int, code_manipulation.EvaluatedProgram]:
-        """Convert raw SQL rows into EvaluatedProgram objects."""
-        programs: dict[int, code_manipulation.EvaluatedProgram] = {}
-        for row in rows:
-            (
-                gsn, func_name, func_args, func_body,
-                func_return_type, func_docstring, func_decorators_json,
-                score, opt_params_json,
-                complexity, complexity_detail_json, sample_time, evaluate_time,
-                token_input, token_output, token_cost, _llm_text,
-                error_type, error_message, eval_output,
-            ) = row
-            decorators = tuple(json.loads(func_decorators_json)) if func_decorators_json else ()
-            parsed = code_manipulation.ParsedFunction(
-                name=func_name,
-                args=func_args,
-                body=func_body,
-                return_type=func_return_type,
-                docstring=func_docstring,
-                decorators=decorators,
-            )
-            opt_params = json.loads(opt_params_json) if opt_params_json else None
-            complexity_detail = json.loads(complexity_detail_json) if complexity_detail_json else None
-            token_usage = (token_input, token_output) if token_input is not None else None
-
-            programs[gsn] = code_manipulation.EvaluatedProgram(
-                parsed=parsed,
-                score=score,
-                optimized_params=opt_params,
-                complexity=complexity,
-                complexity_detail=complexity_detail,
-                global_sample_nums=gsn,
-                sample_time=sample_time,
-                evaluate_time=evaluate_time,
-                token_usage=token_usage,
-                token_cost=token_cost,
-                error_type=error_type,
-                error_message=error_message,
-                eval_output=eval_output,
-            )
-        return programs
-
-    def load_programs(self) -> dict[int, code_manipulation.EvaluatedProgram]:
-        rows = self._conn.execute("SELECT * FROM programs").fetchall()
-        return self._rows_to_programs(rows)
-
-    def load_programs_by_ids(
-        self, gsn_list: list[int],
-    ) -> dict[int, code_manipulation.EvaluatedProgram]:
-        """Load specific programs by their global_sample_num primary keys."""
+    def load_bodies_by_ids(self, gsn_list: list[int]) -> dict[int, tuple[str, float | None]]:
+        """Return {gsn: (body, score)} for the given global_sample_nums."""
         if not gsn_list:
             return {}
         placeholders = ",".join("?" * len(gsn_list))
         rows = self._conn.execute(
-            f"SELECT * FROM programs WHERE global_sample_num IN ({placeholders})",
+            "SELECT global_sample_num, func_body, score FROM programs"
+            f" WHERE global_sample_num IN ({placeholders})",
             gsn_list,
         ).fetchall()
-        return self._rows_to_programs(rows)
+        return {gsn: (body, score) for gsn, body, score in rows}
 
     def load_island_index(self) -> dict[int, dict[int, list[tuple[int, float]]]]:
         """Returns ``{island_id: {complexity_bin: [(gsn, score), ...]}}``.
@@ -399,10 +271,10 @@ class CheckpointDB:
         }
 
     def load_island_stats(self) -> list[dict]:
-        """Returns list of dicts with island_id, size, best_score, best_gsn."""
+        """Returns list of dicts with island_id, size, best_score, best_gsn, best_complexity."""
         rows = self._conn.execute(
-            "SELECT island_id, size, best_score, best_gsn FROM island_stats"
-            " ORDER BY island_id",
+            "SELECT island_id, size, best_score, best_gsn, best_complexity"
+            " FROM island_stats ORDER BY island_id",
         ).fetchall()
         return [
             {
@@ -410,6 +282,7 @@ class CheckpointDB:
                 "size": r[1],
                 "best_score": _score_from_db(r[2]),
                 "best_gsn": r[3],
+                "best_complexity": r[4],
             }
             for r in rows
         ]
@@ -417,15 +290,14 @@ class CheckpointDB:
     def load_run_config(self) -> dict | None:
         """Load the stored run_config row. Returns dict or None if not stored."""
         row = self._conn.execute(
-            "SELECT config_yaml, num_islands, complexity_bin_size"
+            "SELECT num_islands, complexity_bin_size"
             " FROM run_config WHERE id = 1",
         ).fetchone()
         if row is None:
             return None
         return {
-            "config_yaml": row[0],
-            "num_islands": row[1],
-            "complexity_bin_size": row[2],
+            "num_islands": row[0],
+            "complexity_bin_size": row[1],
         }
 
     def validate_config(self, num_islands: int, complexity_bin_size: int) -> None:
@@ -454,3 +326,96 @@ class CheckpointDB:
     def is_populated(self) -> bool:
         row = self._conn.execute("SELECT COUNT(*) FROM global_stats").fetchone()
         return row[0] > 0
+
+
+# ---------------------------------------------------------------------------
+# Separate logs database
+# ---------------------------------------------------------------------------
+
+_LOGS_SCHEMA_SQL = """\
+PRAGMA journal_mode = WAL;
+PRAGMA synchronous = NORMAL;
+
+CREATE TABLE IF NOT EXISTS program_logs (
+    global_sample_num   INTEGER PRIMARY KEY,
+    llm_response_text   TEXT,
+    error_type          TEXT,
+    error_message       TEXT,
+    eval_output         TEXT,
+    complexity          INTEGER,
+    complexity_detail   TEXT,
+    optimized_params    TEXT,
+    sample_time         REAL,
+    evaluate_time       REAL,
+    token_usage_input   INTEGER,
+    token_usage_output  INTEGER,
+    token_cost          REAL
+);
+"""
+
+
+class LogsDB:
+    """SQLite-backed store for program log columns (write-only at runtime)."""
+
+    def __init__(self, db_path: str) -> None:
+        try:
+            if db_path != ":memory:":
+                os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+            self._conn = sqlite3.connect(db_path, timeout=30)
+            self._conn.executescript(_LOGS_SCHEMA_SQL)
+            self._ensure_schema_compat()
+        except (sqlite3.Error, OSError) as e:
+            raise OSError(f"Failed to open logs DB at {db_path}: {e}") from e
+        self._db_path = db_path
+        logger.info("LogsDB opened at %s", db_path)
+
+    def _ensure_schema_compat(self) -> None:
+        """Apply lightweight migrations for existing logs DB files."""
+        cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(program_logs)").fetchall()
+        }
+        if "complexity" not in cols:
+            self._conn.execute("ALTER TABLE program_logs ADD COLUMN complexity INTEGER")
+            self._conn.commit()
+
+    def insert_log(
+        self,
+        global_sample_num: int,
+        llm_response_text: str | None,
+        error_type: str | None,
+        error_message: str | None,
+        eval_output: str | None,
+        *,
+        complexity: int | None = None,
+        complexity_detail: str | None = None,
+        optimized_params: str | None = None,
+        sample_time: float | None = None,
+        evaluate_time: float | None = None,
+        token_usage_input: int | None = None,
+        token_usage_output: int | None = None,
+        token_cost: float | None = None,
+    ) -> None:
+        self._conn.execute(
+            """INSERT OR REPLACE INTO program_logs (
+                global_sample_num, llm_response_text,
+                error_type, error_message, eval_output,
+                complexity, complexity_detail, optimized_params,
+                sample_time, evaluate_time,
+                token_usage_input, token_usage_output, token_cost
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                global_sample_num, llm_response_text,
+                error_type, error_message, eval_output,
+                complexity, complexity_detail, optimized_params,
+                sample_time, evaluate_time,
+                token_usage_input, token_usage_output, token_cost,
+            ),
+        )
+        self._conn.commit()
+
+    def close(self) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+            logger.info("LogsDB closed")

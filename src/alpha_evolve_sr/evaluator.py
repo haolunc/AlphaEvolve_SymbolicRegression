@@ -108,8 +108,8 @@ def _execute_in_subprocess(
         (result, success, error_str, eval_output) — *error_str* is ``None``
         on success. *eval_output* contains captured stdout/stderr text.
     """
-    try:
-        with _capture_fd_output() as get_captured:
+    with _capture_fd_output() as get_captured:
+        try:
             namespace: dict = {}
             exec(program, namespace)
 
@@ -121,10 +121,10 @@ def _execute_in_subprocess(
             result = function(data_dict)
 
             return result, True, None, get_captured()
-    except Exception as e:
-        error_str = f"{type(e).__name__}: {e}"
-        logger.error("Execution failed: %s", error_str)
-        return None, False, error_str, get_captured()
+        except Exception as e:
+            error_str = f"{type(e).__name__}: {e}"
+            logger.error("Execution failed: %s", error_str)
+            return None, False, error_str, get_captured()
 
 
 class Sandbox:
@@ -225,6 +225,16 @@ class Evaluator:
         )
         evaluate_time = time.time() - time_reset
 
+        # Sandbox return paths → _evaluate_body branch mapping:
+        #
+        #   Path                        runs_ok  run_result  error_str          Branch
+        #   ─────────────────────────── ──────── ────────── ────────────────── ──────────
+        #   evaluate() returns value    True     value       None               if
+        #   evaluate() returns None     True     None        None               else
+        #   evaluate() raises exception False    None        "TypeError: ..."   elif
+        #   Missing evaluate function   False    None        "NameError: ..."   elif
+        #   Timeout                     False    None        "TimeoutError: …"  elif
+        #   Sandbox crash               False    None        "SandboxError: …"  elif
         execution_result: ExecutionResult | None = None
         error_type: str | None = None
         error_message: str | None = None
@@ -236,6 +246,10 @@ class Evaluator:
         elif not runs_ok:
             error_type = "timeout" if "TimeoutError" in (error_str or "") else "execution"
             error_message = error_str
+        else:
+            # evaluate() ran but returned None (e.g. NaN/Inf loss)
+            error_type = "execution"
+            error_message = "evaluate() returned None (possible NaN/Inf loss)"
 
         return EvalResult(
             function=new_function,

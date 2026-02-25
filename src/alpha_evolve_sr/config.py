@@ -224,26 +224,23 @@ class RunConfig:
     def validate(self) -> None:
         """Raise :class:`ValueError` on invalid configuration values."""
 
-        if not self.problem_dir:
-            raise ValueError("Error: problem_dir is required")
-        if not self.data_folder:
-            raise ValueError("Error: data_folder is required")
-        if not self.log_dir:
-            raise ValueError("Error: log_dir is required")
-        if not os.path.isdir(self.problem_dir):
-            raise ValueError(f"Error: problem_dir does not exist: {self.problem_dir}")
+        for name in ("problem_dir", "data_folder", "log_dir"):
+            if not getattr(self, name):
+                raise ValueError(f"Error: {name} is required")
+
+        for name in ("problem_dir", "data_folder"):
+            if not os.path.isdir(getattr(self, name)):
+                raise ValueError(f"Error: {name} does not exist: {getattr(self, name)}")
+
         for fname in ("prompt.txt", "evaluate.py", "equation.py"):
             fpath = os.path.join(self.problem_dir, fname)
             if not os.path.isfile(fpath):
                 raise ValueError(f"Error: required file missing in problem_dir: {fpath}")
-        if not os.path.isdir(self.data_folder):
-            raise ValueError(f"Error: data_folder does not exist: {self.data_folder}")
-        if not isinstance(self.max_samples, int) or self.max_samples < 0:
-            raise ValueError(f"Error: max_samples must be a positive integer, got {self.max_samples}")
-        if not isinstance(self.num_samplers, int) or self.num_samplers < 0:
-            raise ValueError(f"Error: num_samplers must be a positive integer, got {self.num_samplers}")
-        if not isinstance(self.num_evaluators, int) or self.num_evaluators < 0:
-            raise ValueError(f"Error: num_evaluators must be a positive integer, got {self.num_evaluators}")
+
+        for name in ("max_samples", "num_samplers", "num_evaluators"):
+            val = getattr(self, name)
+            if not isinstance(val, int) or val < 0:
+                raise ValueError(f"Error: {name} must be a positive integer, got {val}")
 
         if self.resume_from_ckpt is not None:
             if not os.path.isfile(self.resume_from_ckpt):

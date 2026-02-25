@@ -6,7 +6,6 @@ import pytest
 
 from alpha_evolve_sr.code_manipulation import (
     ParsedFunction,
-    rename_function_calls,
     text_to_function,
     text_to_program,
 )
@@ -58,24 +57,6 @@ class TestTextToProgram:
         fn = program.functions[0]
         assert fn.docstring is None
 
-
-class TestRenameFunctionCalls:
-    """Tests for renaming function calls in code."""
-
-    def test_renames_call(self):
-        code = "def foo():\n    return foo()\n"
-        result = rename_function_calls(code, "foo", "bar")
-        assert "bar()" in result
-
-    def test_does_not_rename_attribute_calls(self):
-        code = "def foo():\n    return obj.foo()\n"
-        result = rename_function_calls(code, "foo", "bar")
-        assert "obj.foo()" in result
-
-    def test_noop_when_name_not_present(self):
-        code = "def baz():\n    return 1\n"
-        result = rename_function_calls(code, "foo", "bar")
-        assert result == code
 
 
 class TestParsedFunctionSanitisation:

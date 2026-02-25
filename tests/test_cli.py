@@ -44,7 +44,6 @@ class TestRunPipeline:
         """Common mocks for run_pipeline tests."""
         mock_database = MagicMock()
         mock_eval_pool = MagicMock()
-        mock_eval_pool._max_workers = 1
         mock_sampler_pool = MagicMock()
         mock_sampler_pool.shutdown = MagicMock()
         mock_llm = MagicMock()
