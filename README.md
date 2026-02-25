@@ -134,8 +134,7 @@ src/alpha_evolve_sr/
 ├── code_manipulation.py # Python code parsing; core data classes for evolution
 ├── complexity.py        # Equation complexity calculation
 ├── logging_config.py    # Unified logging configuration
-├── messages.py          # Pipeline message dataclasses
-└── exceptions.py        # Custom exception hierarchy
+└── messages.py          # Pipeline message dataclasses
 ```
 
 ## Documentation

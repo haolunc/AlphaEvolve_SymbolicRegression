@@ -12,33 +12,6 @@
 - Run lint: `/opt/homebrew/Caskroom/miniforge/base/envs/alpha_evolve_sr/bin/ruff check src/`
 - Run single test: `/opt/homebrew/Caskroom/miniforge/base/envs/alpha_evolve_sr/bin/pytest tests/test_foo.py::TestClass::test_method -v`
 
-## Project Structure
-
-```
-src/alpha_evolve_sr/       # Main package (src layout)
-├── cli.py                 # Entry point: main(), run_pipeline()
-├── code_manipulation.py   # AST parsing: Function, Program dataclasses
-├── database.py            # Evolutionary algorithm: ProgramsDatabase, Island, Cluster
-├── sampler.py             # LLM provider abstraction (OpenAI, Qwen, Gemini)
-├── evaluator.py           # Sandbox code execution + mp.Pool worker functions
-├── profiler.py            # TensorBoard logging
-├── config.py              # Frozen config dataclasses
-├── checkpoint.py          # SQLite-based persistence
-├── complexity.py          # AST complexity scoring
-├── exceptions.py          # Custom exception hierarchy
-├── logging_config.py      # Logging setup
-└── messages.py            # Pipeline message dataclasses
-
-tests/                     # pytest tests
-├── conftest.py            # Shared fixtures: sample_function, sample_program, db_config, SAMPLE_SPEC
-├── test_code_manipulation.py
-├── test_database.py
-├── test_checkpoint.py
-├── test_config.py
-├── test_complexity.py
-└── ...
-```
-
 ## Test Conventions
 
 - Use `tmp_path` pytest fixture for temporary directories (avoids teardown issues with file handles)
