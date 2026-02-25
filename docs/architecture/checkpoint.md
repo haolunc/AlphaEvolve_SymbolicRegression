@@ -128,10 +128,6 @@ A single table for debug and analysis data:
 | `token_usage_output` | `INTEGER` | Output token count |
 | `token_cost` | `REAL` | Estimated API cost |
 
-### Migration
-
-`LogsDB._ensure_schema_compat()` runs on open and adds any missing columns (e.g., `complexity` was added after initial release). This makes LogsDB backward-compatible with older DB files.
-
 ---
 
 ## Checkpoint Strategy

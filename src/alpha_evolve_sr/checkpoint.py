@@ -369,16 +369,6 @@ class LogsDB:
         self._db_path = db_path
         logger.info("LogsDB opened at %s", db_path)
 
-    def _ensure_schema_compat(self) -> None:
-        """Apply lightweight migrations for existing logs DB files."""
-        cols = {
-            row[1]
-            for row in self._conn.execute("PRAGMA table_info(program_logs)").fetchall()
-        }
-        if "complexity" not in cols:
-            self._conn.execute("ALTER TABLE program_logs ADD COLUMN complexity INTEGER")
-            self._conn.commit()
-
     def insert_log(
         self,
         global_sample_num: int,

@@ -26,12 +26,12 @@ The search optimizes two competing objectives:
 ## 2. High-Level Loop -- LLM-Guided Evolutionary Search
 
 ```{mermaid}
-flowchart LR
-    DB["Program<br/>Database"] -->|sample programs| P["Prompt<br/>Builder"]
-    P -->|prompt| LLM["LLM"]
-    LLM -->|candidate code| E["Evaluator<br/>(thread-local Sandbox)"]
-    E -->|EvalResult<br/>(score, no complexity)| M["Main Thread"]
-    M -->|attach_complexity<br/>+ register_program| DB
+flowchart TB
+    DB["Program<br/>Database"] -->|"1 · sample programs"| P["Prompt Builder"]
+    P -->|"2 · prompt"| LLM["LLM"]
+    LLM -->|"3 · candidate code"| E["Evaluator"]
+    E -->|"4 · EvalResult"| M["Main Thread"]
+    M -->|"5 · register program"| DB
 ```
 
 1. The **database** samples a handful of previously seen programs and sends them to the **prompt builder**.

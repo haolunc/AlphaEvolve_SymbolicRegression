@@ -15,10 +15,10 @@ Evaluators run inside **evaluator threads** (a `ThreadPoolExecutor` in `cli.py`)
 
 ```{mermaid}
 flowchart LR
-    SM["SampleMessage"] --> Parse["Parse\n(text_to_function)"]
-    Parse -->|success| Splice["Splice\n(_sample_to_program)"]
-    Parse -->|failure| PE["EvalResult\nerror_type='parse'"]
-    Splice --> Sandbox["Sandbox\n(mp.Pool subprocess)"]
+    SM["SampleMessage"] --> Parse["Parse<br/>(text_to_function)"]
+    Parse -->|success| Splice["Splice<br/>(_sample_to_program)"]
+    Parse -->|failure| PE["EvalResult<br/>error_type='parse'"]
+    Splice --> Sandbox["Sandbox<br/>(mp.Pool subprocess)"]
     Sandbox --> ER["EvalResult"]
 ```
 
