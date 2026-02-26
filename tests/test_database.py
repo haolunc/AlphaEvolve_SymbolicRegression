@@ -1,13 +1,14 @@
 """Tests for the programs database."""
 
 import dataclasses
+import os
 
 import numpy as np
 import pytest
 
 from alpha_evolve_sr.code_manipulation import ParsedFunction
 from alpha_evolve_sr.config import ProgramsDatabaseConfig
-from alpha_evolve_sr.database import Island, ParetoEntry, _softmax
+from alpha_evolve_sr.database import Island, ParetoEntry, ProgramsDatabase, _softmax
 from tests.conftest import SAMPLE_PROMPT, SAMPLE_SEED_FUNCTION, make_eval_result, make_sample_message
 
 
@@ -245,4 +246,50 @@ class TestIslandProperties:
         """num_programs reflects how many programs have been registered."""
         island = db._islands[0]
         assert island.num_programs >= 1
+
+
+class TestJsonExportIntegration:
+    """Tests for JSON export wired through ProgramsDatabase."""
+
+    def test_json_export_on_finalize(self, tmp_path):
+        """finalize() produces checkpoint.json when json_export is enabled."""
+        config = ProgramsDatabaseConfig(
+            functions_per_prompt=2,
+            num_islands=2,
+            reset_period=100,
+            cluster_sampling_temperature_init=0.1,
+            cluster_sampling_temperature_period=20,
+            json_export=True,
+        )
+        log_dir = str(tmp_path / "logs")
+        ckpt_dir = str(tmp_path / "ckpt")
+        database = ProgramsDatabase.restore_or_create(
+            config, SAMPLE_PROMPT, log_dir,
+            seed_function=SAMPLE_SEED_FUNCTION,
+            ckpt_dir=ckpt_dir,
+            initial_result=make_eval_result(score=-1.0),
+        )
+        database.finalize()
+        assert os.path.isfile(os.path.join(ckpt_dir, "checkpoint.json"))
+
+    def test_no_json_export_when_disabled(self, tmp_path):
+        """No checkpoint.json when json_export is False."""
+        config = ProgramsDatabaseConfig(
+            functions_per_prompt=2,
+            num_islands=2,
+            reset_period=100,
+            cluster_sampling_temperature_init=0.1,
+            cluster_sampling_temperature_period=20,
+            json_export=False,
+        )
+        log_dir = str(tmp_path / "logs")
+        ckpt_dir = str(tmp_path / "ckpt")
+        database = ProgramsDatabase.restore_or_create(
+            config, SAMPLE_PROMPT, log_dir,
+            seed_function=SAMPLE_SEED_FUNCTION,
+            ckpt_dir=ckpt_dir,
+            initial_result=make_eval_result(score=-1.0),
+        )
+        database.finalize()
+        assert not os.path.exists(os.path.join(ckpt_dir, "checkpoint.json"))
 

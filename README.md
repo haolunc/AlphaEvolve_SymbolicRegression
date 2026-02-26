@@ -95,6 +95,36 @@ resume_from_ckpt: ./log/my_experiment/   # path to checkpoint.db or its parent d
 
 `resume_from_ckpt` is a **YAML config field**, not a CLI flag. Structural parameters (`num_islands`, `complexity_bin_size`) must match the original run; other settings (e.g. `max_samples`, sampler config) can be changed freely.
 
+### JSON Export
+
+By default, checkpoints are stored in SQLite (`checkpoint.db` + `checkpoint_logs.db`). If you prefer a human-readable format, enable periodic JSON export:
+
+```yaml
+database:
+  json_export: true            # default: false
+  json_export_frequency: 50    # export every N steps (default: 50)
+```
+
+This writes a `checkpoint.json` alongside the SQLite files, combining all checkpoint tables and program logs into one file:
+
+```json
+{
+  "checkpoint": {
+    "programs": [...],
+    "island_bins": [...],
+    "pareto_front": [...],
+    "global_stats": {...},
+    "island_stats": [...],
+    "run_config": {...}
+  },
+  "logs": {
+    "program_logs": [...]
+  }
+}
+```
+
+The JSON file is also written on `finalize()` (normal exit or Ctrl+C drain). Non-finite floats (`-inf`, `NaN`) are converted to `null` for JSON compatibility. Writes are atomic (temp file + rename) so partial files won't appear on crash.
+
 ## Graceful Shutdown
 
 The pipeline supports a two-phase shutdown to avoid wasting in-flight LLM calls and evaluations:

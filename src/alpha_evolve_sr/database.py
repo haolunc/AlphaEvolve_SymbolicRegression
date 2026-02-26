@@ -30,7 +30,7 @@ import scipy
 
 from . import code_manipulation, profiler
 from . import config as config_lib
-from .checkpoint import CheckpointDB, LogsDB
+from .checkpoint import CheckpointDB, LogsDB, export_json
 from .logging_config import get_logger
 from .messages import EvalResult, ExecutionResult, Prompt, SampleMessage
 from .profiler import ProfileMetrics
@@ -260,6 +260,7 @@ class ProgramsDatabase:
         self._logs_db = logs_db
         self._max_samples = max_samples
         self._steps_since_checkpoint = 0
+        self._steps_since_json_export = 0
 
         # Transient pipeline stats (not checkpointed)
         self._pending_evals: int | None = None
@@ -436,6 +437,8 @@ class ProgramsDatabase:
             # Final checkpoint of all derived data
             with self._checkpoint_db.transaction():
                 self._checkpoint_derived()
+            if self._config.json_export:
+                self._export_json()
             self._checkpoint_db.close()
         if self._logs_db:
             self._logs_db.close()
@@ -618,6 +621,13 @@ class ProgramsDatabase:
             self._checkpoint_derived()
             self._steps_since_checkpoint = 0
 
+        # Periodic JSON export
+        if self._config.json_export:
+            self._steps_since_json_export += 1
+            if self._steps_since_json_export >= self._config.json_export_frequency:
+                self._export_json()
+                self._steps_since_json_export = 0
+
         if self._global_sample_nums - self._last_reset_step > self._config.reset_period:
             self._last_reset_step = self._global_sample_nums
             self.reset_islands()
@@ -652,6 +662,16 @@ class ProgramsDatabase:
             )
             for iid in range(self._config.num_islands)
         ])
+
+    def _export_json(self) -> None:
+        """Export checkpoint state as JSON. Failures are logged, not raised."""
+        if not self._ckpt_dir:
+            return
+        output_path = os.path.join(self._ckpt_dir, "checkpoint.json")
+        try:
+            export_json(self._checkpoint_db, self._logs_db, output_path)
+        except Exception:
+            logger.exception("Failed to export checkpoint JSON to %s", output_path)
 
     def _update_profiling_stats(self, program: _RegisteredProgram) -> None:
         """Update aggregate profiling statistics with a newly evaluated *program*."""

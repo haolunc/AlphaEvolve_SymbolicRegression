@@ -168,7 +168,7 @@ When `database.should_stop` becomes `True` (i.e., `max_samples` reached):
 | Trigger | Behavior |
 |---------|----------|
 | **1st** Ctrl+C | Set `graceful_shutdown` → exit main loop → `_drain_pipeline()` (wait up to 120 s per sampler, 60 s per eval) → finalize |
-| **2nd** Ctrl+C | Set `force_shutdown` → abort drain immediately → finalize with whatever results were collected |
+| **2nd** Ctrl+C | Set `force_shutdown` → abort drain immediately → finalize → `os._exit(0)` |
 
 The `_drain_pipeline()` function processes in-flight work in two phases:
 
@@ -176,6 +176,23 @@ The `_drain_pipeline()` function processes in-flight work in two phases:
 2. **Phase 2**: wait for pending eval futures → `_attach_complexity()` → `register_program()`
 
 A second Ctrl+C during either phase sets a `force_event` that breaks out immediately.
+
+### Force Shutdown and `os._exit(0)`
+
+On force shutdown (2nd Ctrl+C), the process calls `os._exit(0)` after all cleanup completes. This is necessary because `eval_pool` worker threads are **non-daemon** and may be stuck in `sandbox.run()` (waiting on a subprocess via `async_result.get()`). Without `os._exit`, Python's `threading._shutdown()` would block indefinitely trying to join these threads — requiring a 3rd Ctrl+C to kill the process.
+
+Before calling `os._exit(0)`, the main thread terminates all sandbox `mp.Pool` instances via a shared `_all_evaluators` registry (populated during `_init_eval_thread`). This avoids leaked-semaphore warnings from `multiprocessing.resource_tracker`.
+
+`os._exit(0)` is safe at this point because all user-visible state has already been persisted:
+
+| Cleanup step | Done before `os._exit`? |
+|-------------|------------------------|
+| Restore default SIGINT handler | Yes |
+| Cancel pending sampler futures | Yes |
+| Close LLM client | Yes |
+| Flush & close CheckpointDB / LogsDB | Yes |
+| Signal eval_pool to stop | Yes |
+| Terminate sandbox pools (`_all_evaluators`) | Yes |
 
 ---
 

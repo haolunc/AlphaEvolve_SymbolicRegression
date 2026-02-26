@@ -30,6 +30,8 @@ logger = get_logger("cli")
 # ---------------------------------------------------------------------------
 
 _eval_tls = threading.local()
+_all_evaluators: list[Evaluator] = []  # shared registry for force-shutdown cleanup
+_all_evaluators_lock = threading.Lock()
 
 
 def _init_eval_thread(
@@ -40,6 +42,8 @@ def _init_eval_thread(
 ) -> None:
     """ThreadPoolExecutor initializer: create a persistent Evaluator per thread."""
     _eval_tls.evaluator = Evaluator(evaluate_code, seed_function, data_dict, config=config)
+    with _all_evaluators_lock:
+        _all_evaluators.append(_eval_tls.evaluator)
 
 
 def _eval_thread_analyse(
@@ -131,12 +135,47 @@ def _sampler_task(
 # Unified pipeline
 # ---------------------------------------------------------------------------
 
-def _cleanup_eval_threads(eval_pool: ThreadPoolExecutor, num_workers: int) -> None:
+_FORCE_SENTINEL = object()
+
+
+def _wait_future(
+    fut: Future,
+    force_event: threading.Event,
+    total_timeout: float,
+    poll_interval: float = 0.5,
+) -> object:
+    """Poll *fut* in short intervals, checking *force_event* between polls.
+
+    Returns the future's result on success, or ``_FORCE_SENTINEL`` if
+    *force_event* is set before the future completes.
+    """
+    deadline = time.time() + total_timeout
+    while True:
+        if force_event.is_set():
+            return _FORCE_SENTINEL
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return fut.result(timeout=0)  # raise TimeoutError if not done
+        try:
+            return fut.result(timeout=min(poll_interval, remaining))
+        except TimeoutError:
+            continue
+
+
+def _cleanup_eval_threads(
+    eval_pool: ThreadPoolExecutor,
+    num_workers: int,
+    force_event: threading.Event | None = None,
+) -> None:
     """Clean up Sandbox subprocesses in all evaluator threads."""
+    if force_event is not None and force_event.is_set():
+        return
     futs = []
     for _ in range(num_workers):
         futs.append(eval_pool.submit(lambda: _eval_tls.evaluator.clean()))
     for f in futs:
+        if force_event is not None and force_event.is_set():
+            return
         try:
             f.result(timeout=5)
         except Exception:
@@ -160,7 +199,9 @@ def _drain_pipeline(
         if force_event.is_set():
             return
         try:
-            msg = fut.result(timeout=120)
+            msg = _wait_future(fut, force_event, total_timeout=120)
+            if msg is _FORCE_SENTINEL:
+                return
             if msg is not None:
                 logger.info(
                     "Drain sample completed: island=%d, tokens=(%d,%d), time=%.2fs",
@@ -171,15 +212,20 @@ def _drain_pipeline(
                 )
                 ef = eval_pool.submit(_eval_thread_analyse, msg)
                 pending_eval_futures.add(ef)
+        except TimeoutError:
+            logger.warning("Drain sampler timed out (120s)")
         except Exception as e:
-            logger.error("Drain sampler error: %s", e)
+            logger.error("Drain sampler error: %s", e or type(e).__name__)
 
     # Phase 2: wait for all eval futures → register
     for ef in list(pending_eval_futures):
         if force_event.is_set():
             return
         try:
-            eval_result, sample_msg = ef.result(timeout=60)
+            result = _wait_future(ef, force_event, total_timeout=60)
+            if result is _FORCE_SENTINEL:
+                return
+            eval_result, sample_msg = result
             eval_result = _attach_complexity(eval_result)
             database.register_program(eval_result, sample_msg)
             if eval_result.execution_result is not None:
@@ -218,6 +264,8 @@ def run_pipeline(
             └── Each thread has Evaluator (thread-local)
                 └── Sandbox(mp.Pool(1))  ← only mp.Pool left
     """
+    force_shutdown = threading.Event()
+
     eval_pool = ThreadPoolExecutor(
         max_workers=run_config.num_evaluators,
         initializer=_init_eval_thread,
@@ -261,7 +309,6 @@ def run_pipeline(
 
         # -- Two-phase Ctrl+C shutdown via signal handler --
         graceful_shutdown = threading.Event()
-        force_shutdown = threading.Event()
         original_sigint = signal.getsignal(signal.SIGINT)
 
         def _sigint_handler(signum, frame):  # noqa: ARG001
@@ -368,8 +415,14 @@ def run_pipeline(
             llm.clean()
             database.finalize()
     finally:
-        _cleanup_eval_threads(eval_pool, run_config.num_evaluators)
+        _cleanup_eval_threads(eval_pool, run_config.num_evaluators, force_shutdown)
         eval_pool.shutdown(wait=False)
+        if force_shutdown.is_set():
+            # Terminate sandbox pools directly from main thread to avoid
+            # leaked semaphore warnings from multiprocessing resource_tracker.
+            for ev in _all_evaluators:
+                ev.clean()
+            os._exit(0)
 
 
 # ---------------------------------------------------------------------------

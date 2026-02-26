@@ -1,11 +1,12 @@
 """Tests for SQLite-backed CheckpointDB and LogsDB."""
 
+import json
 import sqlite3
 from types import SimpleNamespace
 
 import pytest
 
-from alpha_evolve_sr.checkpoint import CheckpointDB, LogsDB
+from alpha_evolve_sr.checkpoint import CheckpointDB, LogsDB, export_json
 from alpha_evolve_sr.code_manipulation import ParsedFunction
 
 from alpha_evolve_sr.database import ParetoEntry
@@ -294,3 +295,126 @@ class TestLogsDB:
     def test_error_on_bad_path(self):
         with pytest.raises(OSError, match="Failed to open"):
             LogsDB("/nonexistent/deeply/nested/path/that/cannot/exist/logs.db")
+
+    def test_load_all_logs(self, logs_db):
+        logs_db.insert_log(1, "resp1", None, None, "out1", sample_time=0.1)
+        logs_db.insert_log(2, "resp2", "Error", "msg", "out2", sample_time=0.2)
+        rows = logs_db.load_all_logs()
+        assert len(rows) == 2
+        assert rows[0]["global_sample_num"] == 1
+        assert rows[1]["error_type"] == "Error"
+
+    def test_load_all_logs_empty(self, logs_db):
+        assert logs_db.load_all_logs() == []
+
+
+class TestLoadAllPrograms:
+    @pytest.fixture
+    def checkpoint_db(self, tmp_path):
+        db = CheckpointDB(str(tmp_path / "test.db"))
+        yield db
+        db.close()
+
+    def test_load_all_programs(self, checkpoint_db):
+        with checkpoint_db.transaction():
+            checkpoint_db.insert_program(make_evaluated_program(1, score=-0.5))
+            checkpoint_db.insert_program(make_evaluated_program(2, score=-0.3))
+        rows = checkpoint_db.load_all_programs()
+        assert len(rows) == 2
+        assert rows[0]["global_sample_num"] == 1
+        assert rows[0]["score"] == -0.5
+        assert rows[1]["global_sample_num"] == 2
+
+    def test_load_all_programs_empty(self, checkpoint_db):
+        assert checkpoint_db.load_all_programs() == []
+
+
+class TestExportJson:
+    @pytest.fixture
+    def checkpoint_db(self, tmp_path):
+        db = CheckpointDB(str(tmp_path / "ckpt.db"))
+        yield db
+        db.close()
+
+    @pytest.fixture
+    def logs_db(self, tmp_path):
+        db = LogsDB(str(tmp_path / "logs.db"))
+        yield db
+        db.close()
+
+    def test_export_creates_valid_json(self, checkpoint_db, logs_db, tmp_path):
+        """Round-trip: populate both DBs, export, and verify JSON structure."""
+        with checkpoint_db.transaction():
+            checkpoint_db.insert_program(make_evaluated_program(1, score=-0.5))
+            checkpoint_db.save_global_stats(
+                global_sample_num=1, last_reset_step=1, best_score=-0.5,
+                success_count=1, failed_count=0,
+                tot_sample_time=0.1, tot_evaluate_time=0.2, tot_token_cost=0.001,
+            )
+            checkpoint_db.save_run_config(num_islands=2, complexity_bin_size=10)
+        logs_db.insert_log(1, "text", None, None, "output")
+
+        out = str(tmp_path / "checkpoint.json")
+        export_json(checkpoint_db, logs_db, out)
+
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+
+        assert "checkpoint" in data
+        assert "logs" in data
+        assert len(data["checkpoint"]["programs"]) == 1
+        assert data["checkpoint"]["global_stats"]["global_sample_num"] == 1
+        assert data["checkpoint"]["run_config"]["num_islands"] == 2
+        assert len(data["logs"]["program_logs"]) == 1
+
+    def test_export_without_logs_db(self, checkpoint_db, tmp_path):
+        """When logs_db is None, logs section should be empty."""
+        with checkpoint_db.transaction():
+            checkpoint_db.insert_program(make_evaluated_program(1, score=-0.5))
+            checkpoint_db.save_global_stats(
+                global_sample_num=1, last_reset_step=1, best_score=-0.5,
+                success_count=1, failed_count=0,
+                tot_sample_time=0.1, tot_evaluate_time=0.2, tot_token_cost=0.001,
+            )
+
+        out = str(tmp_path / "checkpoint.json")
+        export_json(checkpoint_db, None, out)
+
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["logs"] == {}
+
+    def test_neg_inf_becomes_null(self, checkpoint_db, tmp_path):
+        """-inf best_score should become null in JSON output."""
+        with checkpoint_db.transaction():
+            checkpoint_db.save_global_stats(
+                global_sample_num=0, last_reset_step=1,
+                best_score=float("-inf"),
+                success_count=0, failed_count=0,
+                tot_sample_time=0.0, tot_evaluate_time=0.0, tot_token_cost=0.0,
+            )
+
+        out = str(tmp_path / "checkpoint.json")
+        export_json(checkpoint_db, None, out)
+
+        with open(out, encoding="utf-8") as f:
+            data = json.load(f)
+        assert data["checkpoint"]["global_stats"]["best_score"] is None
+
+    def test_export_indented(self, checkpoint_db, tmp_path):
+        """Output should be human-readable (indented)."""
+        with checkpoint_db.transaction():
+            checkpoint_db.save_global_stats(
+                global_sample_num=0, last_reset_step=1, best_score=-1.0,
+                success_count=0, failed_count=0,
+                tot_sample_time=0.0, tot_evaluate_time=0.0, tot_token_cost=0.0,
+            )
+
+        out = str(tmp_path / "checkpoint.json")
+        export_json(checkpoint_db, None, out)
+
+        with open(out, encoding="utf-8") as f:
+            text = f.read()
+        # Indented JSON has newlines and leading spaces
+        assert "\n" in text
+        assert "  " in text

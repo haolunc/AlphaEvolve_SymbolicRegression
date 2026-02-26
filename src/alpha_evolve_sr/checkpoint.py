@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import math
 import os
 import sqlite3
+import tempfile
 from contextlib import contextmanager
 
 from .logging_config import get_logger
@@ -300,6 +303,17 @@ class CheckpointDB:
             "complexity_bin_size": row[1],
         }
 
+    def load_all_programs(self) -> list[dict]:
+        """Return all programs as a list of dicts."""
+        rows = self._conn.execute(
+            "SELECT global_sample_num, func_body, score FROM programs"
+            " ORDER BY global_sample_num",
+        ).fetchall()
+        return [
+            {"global_sample_num": gsn, "func_body": body, "score": score}
+            for gsn, body, score in rows
+        ]
+
     def validate_config(self, num_islands: int, complexity_bin_size: int) -> None:
         """Validate that structural config matches stored checkpoint.
 
@@ -363,7 +377,6 @@ class LogsDB:
                 os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
             self._conn = sqlite3.connect(db_path, timeout=30)
             self._conn.executescript(_LOGS_SCHEMA_SQL)
-            self._ensure_schema_compat()
         except (sqlite3.Error, OSError) as e:
             raise OSError(f"Failed to open logs DB at {db_path}: {e}") from e
         self._db_path = db_path
@@ -404,8 +417,96 @@ class LogsDB:
         )
         self._conn.commit()
 
+    def load_all_logs(self) -> list[dict]:
+        """Return all program_logs as a list of dicts."""
+        cursor = self._conn.execute(
+            "SELECT global_sample_num, llm_response_text, error_type,"
+            " error_message, eval_output, complexity, complexity_detail,"
+            " optimized_params, sample_time, evaluate_time,"
+            " token_usage_input, token_usage_output, token_cost"
+            " FROM program_logs ORDER BY global_sample_num",
+        )
+        columns = [desc[0] for desc in cursor.description]
+        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
     def close(self) -> None:
         if self._conn:
             self._conn.close()
             self._conn = None
             logger.info("LogsDB closed")
+
+
+# ---------------------------------------------------------------------------
+# JSON export
+# ---------------------------------------------------------------------------
+
+
+def _sanitize_for_json(obj: object) -> object:
+    """Recursively convert non-finite floats (-inf, inf, NaN) to None."""
+    if isinstance(obj, float) and (math.isinf(obj) or math.isnan(obj)):
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_for_json(v) for v in obj]
+    return obj
+
+
+def _load_island_bins_flat(checkpoint_db: CheckpointDB) -> list[dict]:
+    """Convert nested load_island_index() to a flat list of row dicts."""
+    index = checkpoint_db.load_island_index()
+    rows: list[dict] = []
+    for island_id in sorted(index):
+        for cbin in sorted(index[island_id]):
+            for gsn, score in index[island_id][cbin]:
+                rows.append({
+                    "island_id": island_id,
+                    "complexity_bin": cbin,
+                    "global_sample_num": gsn,
+                    "score": score,
+                })
+    return rows
+
+
+def export_json(
+    checkpoint_db: CheckpointDB,
+    logs_db: LogsDB | None,
+    output_path: str,
+) -> None:
+    """Export the full checkpoint state as a single JSON file.
+
+    Uses atomic write (write to temp file, then ``os.replace``) to avoid
+    partial files on crash.
+    """
+    data: dict = {
+        "checkpoint": {
+            "programs": checkpoint_db.load_all_programs(),
+            "island_bins": _load_island_bins_flat(checkpoint_db),
+            "pareto_front": [
+                {"complexity_bin": cbin, "score": score, "global_sample_num": gsn}
+                for cbin, score, gsn in checkpoint_db.load_pareto_front()
+            ],
+            "global_stats": checkpoint_db.load_global_stats() or {},
+            "island_stats": checkpoint_db.load_island_stats(),
+            "run_config": checkpoint_db.load_run_config() or {},
+        },
+        "logs": {},
+    }
+    if logs_db is not None:
+        data["logs"]["program_logs"] = logs_db.load_all_logs()
+
+    dir_name = os.path.dirname(output_path) or "."
+    fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(_sanitize_for_json(data), f, indent=2)
+        os.replace(tmp_path, output_path)
+    except BaseException:
+        # Clean up temp file on failure
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+    logger.info("Exported checkpoint JSON to %s", output_path)

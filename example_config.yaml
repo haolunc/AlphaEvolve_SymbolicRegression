@@ -45,6 +45,8 @@ database:
   pareto_aware: false
   checkpoint_interval: 10     # Samples between checkpoint saves
   log_frequency: 25           # TensorBoard logging interval (samples)
+  json_export: False
+  json_export_frequency: 50
 
 # =====================================================================
 # Evaluator

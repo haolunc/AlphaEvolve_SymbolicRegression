@@ -24,6 +24,7 @@ import multiprocessing as mp
 import os
 import sys
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -150,7 +151,13 @@ class Sandbox:
         if self._pool is not None:
             try:
                 self._pool.terminate()
-                self._pool.join()
+                # Pool.join() has no timeout param; wrap in a daemon thread
+                # so we don't block indefinitely if the subprocess is stuck.
+                join_thread = threading.Thread(target=self._pool.join, daemon=True)
+                join_thread.start()
+                join_thread.join(timeout=3)
+                if join_thread.is_alive():
+                    logger.warning("Pool.join() did not complete within 3s, moving on")
             # If the pool is already exited
             except Exception:
                 pass

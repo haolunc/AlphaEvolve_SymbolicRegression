@@ -56,6 +56,8 @@ class ProgramsDatabaseConfig:
     pareto_aware: bool = False
     checkpoint_interval: int = 10
     log_frequency: int = 25
+    json_export: bool = False
+    json_export_frequency: int = 50
 
 
 @dataclasses.dataclass(frozen=True)
